@@ -13,6 +13,14 @@ expected failures). ``fanout=false`` collapses to the ``specify`` behaviour
 (tighten + promote, no children), making ``decompose`` a strict superset.
 Unknown assignees are rewritten to ``default_assignee`` — a child NEVER ends
 up with ``assignee=None``.
+
+Dependency semantics (the SAB v2-migration lesson, ``t_4fc1c39a``): the child
+graph must mirror REAL data dependencies. A sequential/phase pipeline
+(install -> implement -> post/integrate -> review -> verify) is emitted as a
+parent CHAIN, never as flat siblings, so the dispatcher cannot start a review
+or verify card before the implementation it checks exists. The system prompt
+below encodes this rule; the DB layer (``kanban_db_graph``) enforces it by
+leaving a ``todo`` child un-promoted until every parent is ``done``.
 """
 
 from __future__ import annotations
@@ -65,8 +73,29 @@ Rules:
   - "parents" is a list of INDICES (0-based) into this same "tasks" list,
     expressing actual data dependencies. Tasks with no parents run in
     PARALLEL. Tasks with parents wait until every parent completes.
-  - Prefer parallelism. If two tasks can be done independently, give
-    them no parents so the dispatcher fans them out at once.
+  - Model real dependencies, not convenience order. Before emitting each
+    child, ask: "does this task consume an artifact, decision, or code that
+    another child produces?" If yes, that other child MUST be listed in this
+    child's "parents".
+  - Prefer parallelism ONLY for work that is genuinely independent: if two
+    tasks can run at the same time without one consuming the other's output,
+    give them no parents so the dispatcher fans them out at once.
+  - Recognize SEQUENTIAL / PHASE pipelines and encode them as a parent CHAIN
+    (a "spine"), NEVER as flat siblings. When the work has ordered phases
+    where each phase consumes the previous phase's output — e.g.
+    install/setup -> implement/change -> integrate/post -> review -> verify —
+    the later task MUST list the earlier one in "parents" (chain:
+    tasks[1].parents=[0], tasks[2].parents=[1], tasks[3].parents=[2], ...).
+    A migration, deploy, or any "do X, then Y, then Z" flow is sequential.
+  - A verification, review, or live-verify task is ALWAYS downstream of the
+    task it checks: its "parents" MUST include the implementation task (directly
+    or through the chain), so the dispatcher cannot start it before the code /
+    artifact exists. NEVER emit a review/verify task as a sibling with no
+    parents. A verify card that runs before its implementation is physically
+    impossible to complete.
+  - When unsure whether two tasks are independent, prefer the dependency edge.
+    A child that waits slightly too long is recoverable; a review/verify that
+    runs before its implementation is not.
   - Use 2-6 tasks for normal work. Don't create 20 tiny tasks. Don't
     cram everything into 1 task.
   - Pick assignees from the roster by matching the task to the profile's

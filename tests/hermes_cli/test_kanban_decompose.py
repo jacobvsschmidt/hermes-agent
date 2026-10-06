@@ -256,3 +256,125 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+def test_decompose_sequential_pipeline_chains_parents(kanban_home):
+    """Regression for t_4fc1c39a: a sequential phase pipeline (the SAB CLOB
+    v2-migration shape) must fan out as a parent CHAIN, so the review/verify
+    cards do NOT become ``ready`` before the implementation card is ``done``.
+
+    Reproduces the original defect: the auto-decomposer emitted 5 flat
+    siblings with no dependency edges, so verify/review ran on a prod host
+    where the migration did not exist yet.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="migrate order path to CLOB v2", triage=True)
+
+    # install -> implement/signer -> post/integrate -> review -> verify
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "sequential migration pipeline",
+        "tasks": [
+            {"title": "install v2 client", "body": "install", "assignee": "infra", "parents": []},
+            {"title": "build v2 signer", "body": "sign", "assignee": "engineer", "parents": [0]},
+            {"title": "post orders via v2", "body": "post", "assignee": "engineer", "parents": [1]},
+            {"title": "review migration diff", "body": "review", "assignee": "reviewer", "parents": [2]},
+            {"title": "live-verify v2 order path", "body": "verify", "assignee": "ops", "parents": [3]},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orch", "infra", "engineer", "reviewer", "ops"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is True
+    ids = outcome.child_ids
+    assert ids and len(ids) == 5
+
+    with kbc.connect() as conn:
+        heads = [kb.get_task(conn, i) for i in ids]
+    # Only the head of the pipeline is runnable; every downstream card waits.
+    assert heads[0].status == "ready"
+    assert [t.status for t in heads[1:]] == ["todo"] * 4
+    # The verify card is NOT ready while the implementation is not done.
+    assert heads[4].status == "todo"
+    assert heads[4].assignee == "ops"
+
+
+def test_verify_not_ready_until_implementation_done(kanban_home):
+    """End-to-end gating: advance the chain one card at a time and prove the
+    review/verify cards only promote AFTER their parent completes."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="seq pipeline", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "install -> impl -> review -> verify",
+        "tasks": [
+            {"title": "install", "body": "x", "assignee": "infra", "parents": []},
+            {"title": "implement", "body": "x", "assignee": "engineer", "parents": [0]},
+            {"title": "review", "body": "x", "assignee": "reviewer", "parents": [1]},
+            {"title": "verify", "body": "x", "assignee": "ops", "parents": [2]},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orch", "infra", "engineer", "reviewer", "ops"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    install, impl, review, verify = outcome.child_ids
+
+    def status(conn, cid):
+        return kb.get_task(conn, cid).status
+
+    with kbc.connect() as conn:
+        assert status(conn, install) == "ready"
+        assert status(conn, impl) == "todo"
+        assert status(conn, review) == "todo"
+        assert status(conn, verify) == "todo"
+
+    # Complete install -> only implement promotes; review/verify still wait.
+    with kbc.connect() as conn:
+        assert kb.complete_task(conn, install, result="installed")
+    with kbc.connect() as conn:
+        assert status(conn, impl) == "ready"
+        assert status(conn, review) == "todo"
+        assert status(conn, verify) == "todo"  # NOT ready before implementation done
+
+    # Complete implement -> review promotes, verify still waits.
+    with kbc.connect() as conn:
+        assert kb.complete_task(conn, impl, result="implemented")
+    with kbc.connect() as conn:
+        assert status(conn, review) == "ready"
+        assert status(conn, verify) == "todo"
+
+    # Complete review -> verify finally promotes (only now).
+    with kbc.connect() as conn:
+        assert kb.complete_task(conn, review, result="reviewed")
+    with kbc.connect() as conn:
+        assert status(conn, verify) == "ready"
+
+
+def test_system_prompt_requires_dependency_chains_for_pipelines():
+    """Guard: the decomposer prompt must instruct the LLM to encode
+    sequential pipelines as parent chains and never emit a review/verify
+    sibling without parents (t_4fc1c39a)."""
+    p = decomp._SYSTEM_PROMPT.lower()
+    assert "parent chain" in p
+    assert "sequential" in p
+    assert "verify" in p and "review" in p
+
+
+
