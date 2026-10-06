@@ -377,4 +377,81 @@ def test_system_prompt_requires_dependency_chains_for_pipelines():
     assert "verify" in p and "review" in p
 
 
+def test_decompose_integration_card_gated_on_all_impls(kanban_home):
+    """Regression for t_783d9174: one coherent change to a deployed service
+    (a new order-signer AND a new order-client for the same live order path)
+    must end in an integration/deploy card whose parents are EVERY
+    implementation child. Prove that integration card does NOT become
+    ``ready`` until all implementation cards are ``done`` — the acceptance
+    criterion for this card.
+
+    Reproduces the original defect: the two halves of the same change drifted
+    into different trees (repo=signer, prod host=client) and no card owned the
+    integration, so nothing reconciled them.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="migrate live order path to v2", triage=True)
+
+    # Two independent impl cards (signer / client) feed ONE integration/deploy
+    # card whose parents are both of them.
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "one coherent change -> two impls + one integration/deploy card",
+        "tasks": [
+            {"title": "build v2 signer", "body": "sign", "assignee": "engineer", "parents": []},
+            {"title": "move client to v2", "body": "post", "assignee": "engineer", "parents": []},
+            {"title": "integrate + deploy v2 on prod", "body": "deploy", "assignee": "ops", "parents": [0, 1]},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orch", "engineer", "ops"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is True
+    signer, client, integrate = outcome.child_ids
+
+    def status(conn, cid):
+        return kb.get_task(conn, cid).status
+
+    with kbc.connect() as conn:
+        # Both impls run in parallel; the integration/deploy card waits.
+        assert status(conn, signer) == "ready"
+        assert status(conn, client) == "ready"
+        assert status(conn, integrate) == "todo"
+        assert kb.get_task(conn, integrate).assignee == "ops"
+
+    # Complete only ONE impl -> integration must STILL wait.
+    with kbc.connect() as conn:
+        assert kb.complete_task(conn, signer, result="signer built")
+    with kbc.connect() as conn:
+        assert status(conn, integrate) == "todo"
+
+    # Complete the second impl -> only now does integration/deploy promote.
+    with kbc.connect() as conn:
+        assert kb.complete_task(conn, client, result="client moved")
+    with kbc.connect() as conn:
+        assert status(conn, integrate) == "ready"
+
+
+def test_system_prompt_requires_integration_deploy_and_single_host_writer():
+    """Guard for t_783d9174: the prompt must require an explicit
+    integration/deploy card for a coherent change to a deployed service, make
+    it the ONLY host writer, and forbid building on an uncommitted prod-host
+    edit (drift)."""
+    p = decomp._SYSTEM_PROMPT.lower()
+    assert "integration/deploy" in p
+    assert "one host writer" in p
+    assert "prod host" in p or "production host" in p
+    assert "drift" in p
+
+
+
 

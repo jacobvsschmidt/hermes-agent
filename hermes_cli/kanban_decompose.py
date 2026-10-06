@@ -21,6 +21,15 @@ parent CHAIN, never as flat siblings, so the dispatcher cannot start a review
 or verify card before the implementation it checks exists. The system prompt
 below encodes this rule; the DB layer (``kanban_db_graph``) enforces it by
 leaving a ``todo`` child un-promoted until every parent is ``done``.
+
+Ownership semantics (the split-migration lesson, ``t_783d9174``): a coherent
+change to a deployed service must end in ONE integration/deploy card whose
+parents are every implementation child, and ONLY that card may write to the
+production host. Implementation children land their work in the repository on
+the one feature branch (commit -> PR); the deploy card deploys from that
+committed branch. A direct, uncommitted edit on a prod host is drift — the
+prompt below tells the decomposer to flag and reconcile it, never to build on
+it.
 """
 
 from __future__ import annotations
@@ -96,6 +105,26 @@ Rules:
   - When unsure whether two tasks are independent, prefer the dependency edge.
     A child that waits slightly too long is recoverable; a review/verify that
     runs before its implementation is not.
+  - ONE COHERENT CHANGE TO A DEPLOYED SERVICE MUST END IN AN INTEGRATION/DEPLOY
+    CARD. When two or more children are parts of the SAME change to one running
+    service (e.g. a new order-signer in one card and a new order-client in
+    another, both for the same live order path), emit an explicit
+    integration/deploy card whose "parents" list EVERY implementation child
+    (parents: [i, j, ...]). The change must land as ONE coordinated unit, never
+    as separate pieces that drift apart, and the integration card waits until
+    all of them are done.
+  - "ONE HOST WRITER" — ONLY the integration/deploy card may write to the
+    production host or run a deploy. No implementation child touches the live
+    host; it lands its change in the repository on the ONE feature branch
+    (commit -> PR). The deploy card deploys FROM that committed branch, so the
+    running service and the repository never disagree.
+  - NEVER emit a task that edits a production host directly. An edit applied on
+    the host that is not in the repository is DRIFT, not a fix: the next
+    repo-based deploy silently reverts it. If you find (or a child reports) an
+    uncommitted host edit, emit a task to RECONCILE it — commit it into the
+    feature branch (or revert it) — and never build further on the uncommitted
+    state. A change that lives only on one host is invisible to review and lost
+    on the next deploy.
   - Use 2-6 tasks for normal work. Don't create 20 tiny tasks. Don't
     cram everything into 1 task.
   - Pick assignees from the roster by matching the task to the profile's
