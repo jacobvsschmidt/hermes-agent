@@ -619,6 +619,32 @@ _STATUS_HANDLERS: dict[str, Any] = {
     "triage": lambda conn, tid, p: _drag_to(conn, tid, "triage")}
 
 
+# Danish labels for the receipt comment every status change leaves on the card
+# ("<handling> af <bruger> kl. <tid>"). Mirrors the CLI archive/unarchive
+# receipts so a card shows who did what no matter which path performed it.
+_STATUS_RECEIPT_LABELS: dict[str, str] = {
+    "done": "Fuldført",
+    "blocked": "Blokeret",
+    "scheduled": "Planlagt",
+    "review": "Sendt til review",
+    "ready": "Flyttet til klar",
+    "todo": "Flyttet til todo",
+    "triage": "Flyttet til triage",
+}
+
+
+def _status_receipt(conn, task_id: str, status: str, actor: Optional[str]) -> None:
+    """Write the receipt comment for a *successful* status change.
+
+    Only ever called after ``ok`` — a refused/no-op transition raises before
+    this point, so a silent no-op can never get a receipt stamped on it.
+    ``_receipt_comment`` is best-effort (logs on failure, never fails the
+    action) and returns early when ``actor`` is empty.
+    """
+    kanban_db._receipt_comment(
+        conn, task_id, _STATUS_RECEIPT_LABELS.get(status, f"Status → {status}"), actor)
+
+
 def _apply_status(conn, task_id: str, s: str, p, unknown_detail: str) -> bool:
     """Dispatch a status verb; raises ``_StatusRejected`` (user-facing message)
     for ``running`` or an unknown status (``unknown_detail``)."""
@@ -663,6 +689,8 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     else:
         with _map_errors(400, _StatusRejected, ValueError):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
+        if ok and s:
+            _status_receipt(conn, task_id, s, actor)
         if s == "review" and ok and review_assignee_deferred and not payload.assignee:
             ok = kanban_db.assign_task(conn, task_id, None)
     if ok:
@@ -866,7 +894,10 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
         if s == "unarchived":
             if not kanban_db.unarchive_task(conn, tid, author=actor):
                 entry.update(ok=False, error="unarchive refused (must be archived)")
-        elif not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
+        elif _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
+            if s:
+                _status_receipt(conn, tid, s, actor)
+        else:
             entry.update(ok=False, error=_open_parent_refusal(conn, tid, s) or f"transition to {s!r} refused")
     if payload.assignee is not None:
         try:

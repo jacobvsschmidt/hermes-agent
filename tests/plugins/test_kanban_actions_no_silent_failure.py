@@ -158,6 +158,8 @@ def test_bulk_move_changes_every_card(client):
     assert all(x["ok"] for x in results), results
     assert _status(client, a) == "blocked"
     assert _status(client, b) == "blocked"
+    for tid in (a, b):
+        assert _comments(client, tid), f"bulk move left no receipt on {tid}"
 
 
 # ---------------------------------------------------------------------------
@@ -222,18 +224,26 @@ def test_delete_archives_and_is_reversible(client):
 # 4. Every action leaves a receipt comment on the card
 # ---------------------------------------------------------------------------
 
+# Every UI action must leave a receipt comment — not just archive/unarchive.
+# (verb, start-status, extra payload).
 RECEIPT_ACTIONS = [
-    ("archived", "ready"),
-    ("unarchived", "archived"),
+    ("triage", "ready", {}),
+    ("todo", "ready", {}),
+    ("ready", "todo", {}),
+    ("blocked", "ready", {}),
+    ("scheduled", "ready", {}),
+    ("done", "ready", {"result": "shipped", "summary": "shipped"}),
+    ("archived", "ready", {}),
+    ("unarchived", "archived", {}),
 ]
 
 
-@pytest.mark.parametrize("verb,start", RECEIPT_ACTIONS, ids=[a[0] for a in RECEIPT_ACTIONS])
-def test_action_writes_receipt_comment(client, verb, start):
+@pytest.mark.parametrize("verb,start,extra", RECEIPT_ACTIONS, ids=[a[0] for a in RECEIPT_ACTIONS])
+def test_action_writes_receipt_comment(client, verb, start, extra):
     tid = _reach(client, start)
     before = len(_comments(client, tid))
 
-    r = _move(client, tid, verb)
+    r = _move(client, tid, verb, **extra)
     assert r.status_code == 200, r.text
 
     comments = _comments(client, tid)
