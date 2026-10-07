@@ -1126,11 +1126,12 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         return _err("choose either task_ids to archive or --rm archived task_ids")
     if not ids and not purge_ids:
         return _err("at least one task_id is required")
+    author = _profile_author()
     with kbc.connect_closing() as conn:
         if purge_ids:
             return _bulk_apply(purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
                                lambda tid: f"cannot delete {tid} (must already be archived)")
-        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
+        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid, author=author),
                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
 
 
@@ -1138,8 +1139,9 @@ def _cmd_unarchive(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     if not ids:
         return _err("at least one task_id is required")
+    author = _profile_author()
     with kbc.connect_closing() as conn:
-        return _bulk_apply(ids, lambda tid: kb.unarchive_task(conn, tid),
+        return _bulk_apply(ids, lambda tid: kb.unarchive_task(conn, tid, author=author),
                            lambda tid: f"Unarchived {tid}", lambda tid: f"cannot unarchive {tid} (must be archived)")
 
 

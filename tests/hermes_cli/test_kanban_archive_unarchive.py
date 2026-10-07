@@ -177,6 +177,43 @@ def test_cli_unarchive_refuses_active_task(kanban_home):
     assert kc.kanban_command(args) == 1
 
 
+def test_cli_archive_writes_receipt_comment(kanban_home):
+    """The real CLI surface must pass the invoking actor -> a receipt is written.
+
+    Regression for t_6476b1e0: ``_cmd_archive`` called ``archive_task`` without
+    ``author=`` so the audit comment was never emitted in production.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="cli receipt", assignee="alice")
+
+    args = _parser().parse_args(["kanban", "archive", tid])
+    assert kc.kanban_command(args) == 0
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "archived"
+        bodies = [c.body for c in kb.list_comments(conn, tid)]
+    receipts = [b for b in bodies if b.startswith("Arkiveret af ")]
+    assert receipts, f"CLI archive left no receipt comment, got {bodies!r}"
+    assert " kl. " in receipts[-1], receipts[-1]
+
+
+def test_cli_unarchive_writes_receipt_comment(kanban_home):
+    """Unarchive via the CLI also records its audit receipt (t_6476b1e0)."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="cli unreceipt", assignee="alice")
+        assert kb.archive_task(conn, tid) is True
+
+    args = _parser().parse_args(["kanban", "unarchive", tid])
+    assert kc.kanban_command(args) == 0
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"
+        bodies = [c.body for c in kb.list_comments(conn, tid)]
+    receipts = [b for b in bodies if b.startswith("Genåbnet fra arkiv af ")]
+    assert receipts, f"CLI unarchive left no receipt comment, got {bodies!r}"
+    assert " kl. " in receipts[-1], receipts[-1]
+
+
 # ---------------------------------------------------------------------------
 # Dashboard API: PATCH + bulk status="unarchived"
 # ---------------------------------------------------------------------------
