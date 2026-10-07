@@ -149,19 +149,32 @@
   function getColumnHelp(t, status) {
     return tx(t, "columnHelp." + status, FALLBACK_COLUMN_HELP[status] || "");
   }
-  function getDestructiveConfirm(t, status, count) {
+  // Archiving releases the card's claim and terminates a worker that is
+  // mid-run ("archived" is a terminal status). Warn explicitly when the card
+  // being archived is currently running, so an operator does not kill an
+  // active job by accident. The archive itself stays reversible (unarchive
+  // restores the card), but a killed run does not resume on its own.
+  function archiveRunningWorkerWarning(t, status, sourceStatus) {
+    if (status !== "archived" || sourceStatus !== "running") return "";
+    return tx(t, "archiveRunningWarning", "Dette dræber den kørende worker.");
+  }
+  function getDestructiveConfirm(t, status, count, sourceStatus) {
     const key = DESTRUCTIVE_KEYS[status];
     if (!key) return null;
     // For bulk operations, use the *Many variant of the i18n key so the
     // copy pluralizes correctly ("Mark 3 tasks as done?" instead of
     // "Mark this task as done?"). Falls back to the singular English
     // string if a translation for the *Many key isn't shipped.
+    let msg;
     if (count && count > 1) {
       const manyKey = key + "Many";
       const manyFallback = FALLBACK_DESTRUCTIVE_MANY[status] || FALLBACK_DESTRUCTIVE[status];
-      return tx(t, manyKey, manyFallback, { n: count });
+      msg = tx(t, manyKey, manyFallback, { n: count });
+    } else {
+      msg = tx(t, key, FALLBACK_DESTRUCTIVE[status]);
     }
-    return tx(t, key, FALLBACK_DESTRUCTIVE[status]);
+    const warning = archiveRunningWorkerWarning(t, status, sourceStatus);
+    return warning ? msg + " " + warning : msg;
   }
   function getDiagnosticEventLabel(t, kind) {
     const key = DIAGNOSTIC_EVENT_KIND_KEYS[kind];
@@ -924,8 +937,8 @@
     //      dialog (chained via Promise).
     //   3. On confirm of all steps, call performMoveTask.
     //   4. On cancel anywhere, do nothing.
-    const requestMoveConfirm = useCallback(function (newStatus, count) {
-      const confirmMsg = getDestructiveConfirm(t, newStatus, count);
+    const requestMoveConfirm = useCallback(function (newStatus, count, sourceStatus) {
+      const confirmMsg = getDestructiveConfirm(t, newStatus, count, sourceStatus);
       if (!confirmMsg) return Promise.resolve({ confirmed: true });
       return kanbanDialogs.request({
         kind: "confirm",
@@ -961,9 +974,21 @@
     }, [t]);
 
     // Single-task card move. Drives confirmation + completion summary
-    // dialogs via the hook, then dispatches via performMoveTask.
+    // dialogs via the hook, then dispatches via performMoveTask. Resolves
+    // the task's current status from the live board so the archive
+    // confirmation can warn before killing a running worker.
+    const findBoardTask = useCallback(function (taskId) {
+      if (!boardData || !boardData.columns) return null;
+      for (const col of boardData.columns) {
+        const hit = col.tasks.find(function (tk) { return tk.id === taskId; });
+        if (hit) return hit;
+      }
+      return null;
+    }, [boardData]);
+
     const moveTask = useCallback(function (taskId, newStatus) {
-      requestMoveConfirm(newStatus, 1)
+      const sourceTask = findBoardTask(taskId);
+      requestMoveConfirm(newStatus, 1, sourceTask ? sourceTask.status : null)
         .then(function (r1) {
           if (!r1.confirmed) return null;
           if (newStatus !== "done") {
@@ -976,7 +1001,7 @@
           });
         })
         .catch(function () { /* dialog cancelled */ });
-    }, [requestMoveConfirm, requestCompletionSummary, performMoveTask]);
+    }, [findBoardTask, requestMoveConfirm, requestCompletionSummary, performMoveTask]);
 
     const clearSelected = useCallback(function () {
       setSelectedIds(new Set());
@@ -987,7 +1012,13 @@
       if (selectedIds.size === 0) return;
       const count = selectedIds.size;
       const taskId = Array.from(selectedIds)[0]; // representative id for performMoveTask's single-task branch
-      requestMoveConfirm(newStatus, count)
+      const anyRunning = !!(boardData && boardData.columns &&
+        boardData.columns.some(function (col) {
+          return col.tasks.some(function (tk) {
+            return selectedIds.has(tk.id) && tk.status === "running";
+          });
+        }));
+      requestMoveConfirm(newStatus, count, anyRunning ? "running" : null)
         .then(function (r1) {
           if (!r1.confirmed) return null;
           if (newStatus !== "done") {
@@ -1000,7 +1031,7 @@
           });
         })
         .catch(function () { /* dialog cancelled */ });
-    }, [selectedIds, requestMoveConfirm, requestCompletionSummary, performMoveTask]);
+    }, [selectedIds, boardData, requestMoveConfirm, requestCompletionSummary, performMoveTask]);
 
     const createTask = useCallback(function (body) {
       return SDK.fetchJSON(withBoard(`${API}/tasks`, board), {
@@ -4892,7 +4923,7 @@
           task.status === "running" || task.status === "ready" || task.status === "blocked",
           getDestructiveConfirm(t, "done")),
         b(tx(t, "archive", "Archive"),   { status: "archived" }, task.status !== "archived",
-          getDestructiveConfirm(t, "archived")),
+          getDestructiveConfirm(t, "archived", 1, task.status)),
       ),
       specifyMsg ? h("div", {
         className: specifyMsg.ok

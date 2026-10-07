@@ -1180,6 +1180,28 @@ def test_card_archive_action_requests_archived_move():
     assert "PASS" in result.stdout
 
 
+def test_card_archive_confirm_warns_when_killing_running_worker():
+    """Archiving a card is a terminal status: it releases the claim and kills a
+    worker that is mid-run. The destructive-confirm description must therefore
+    carry the "Dette dræber den kørende worker." warning when the card's source
+    status is running, and must NOT when it is not. The bundle has no build
+    step, so the probe extracts the real getDestructiveConfirm (and the
+    FALLBACK_* constants it closes over) verbatim and drives it — behavioral,
+    not a source-text pin.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    bundle = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    probe = Path(__file__).parent / "fixtures" / "kanban_card_archive_running_warning_probe.js"
+    result = subprocess.run(
+        [node, str(probe), str(bundle)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "PASS" in result.stdout
+
+
 # Run clock: current run start, not first-ever start
 # ---------------------------------------------------------------------------
 
