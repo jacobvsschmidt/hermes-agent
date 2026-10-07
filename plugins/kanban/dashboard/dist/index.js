@@ -3073,6 +3073,7 @@
                       toggleSelected: props.toggleSelected,
                       toggleRange: props.toggleRange,
                       onOpen: props.onOpen,
+                      onMove: props.onMove,
                     });
                   }),
                 );
@@ -3087,6 +3088,7 @@
                   toggleSelected: props.toggleSelected,
                   toggleRange: props.toggleRange,
                   onOpen: props.onOpen,
+                  onMove: props.onMove,
                 });
               }),
       ),
@@ -3122,10 +3124,22 @@
     const { t: i18n } = useI18n();
     const t = props.task;
     const cardRef = useRef(null);
+    const [menuOpen, setMenuOpen] = useState(false);
+    const menuRef = useRef(null);
 
     useEffect(function () {
       return attachTouchDrag(cardRef.current, t.id);
     }, [t.id]);
+
+    useEffect(function () {
+      function onClickOutside(e) {
+        if (menuRef.current && !menuRef.current.contains(e.target)) {
+          setMenuOpen(false);
+        }
+      }
+      document.addEventListener("mousedown", onClickOutside);
+      return function () { document.removeEventListener("mousedown", onClickOutside); };
+    }, []);
 
     const handleDragStart = function (e) {
       e.dataTransfer.setData(MIME_TASK, t.id);
@@ -3164,6 +3178,7 @@
       }
       if (e.key === "Escape") {
         if (props.toggleSelected) props.toggleSelected(t.id, false);
+        setMenuOpen(false);
       }
     };
     const handleCheckedChange = function () {
@@ -3172,6 +3187,13 @@
 
     const progress = t.progress;
     const needsAssignee = t.status === "ready" && !t.assignee;
+    const canArchive = t.status !== "archived";
+
+    const handleArchive = function (e) {
+      e.stopPropagation();
+      setMenuOpen(false);
+      if (props.onMove) props.onMove(t.id, "archived");
+    };
 
     return h("div", {
       ref: cardRef,
@@ -3248,6 +3270,27 @@
                   title: tx(i18n, "needsAssigneeHint", "Dependencies are satisfied, but the dispatcher skips this task until you assign a profile."),
                 }, tx(i18n, "needsAssignee", "Needs assignee"))
               : null,
+            canArchive ? h("div", {
+              className: "hermes-kanban-card-actions",
+              ref: menuRef,
+            },
+              h(Button, {
+                size: "sm",
+                variant: "ghost",
+                onClick: function (e) { e.stopPropagation(); setMenuOpen(function (x) { return !x; }); },
+                "aria-label": tx(i18n, "actions", "Actions"),
+                "aria-expanded": menuOpen,
+                "aria-haspopup": true,
+              }, "⋯"),
+              menuOpen ? h("div", { className: "hermes-kanban-card-menu" },
+                h(Button, {
+                  size: "sm",
+                  variant: "ghost",
+                  className: "hermes-kanban-card-menu-item",
+                  onClick: handleArchive,
+                }, tx(i18n, "archive", "Arkiver")),
+              ) : null
+            ) : null,
           ),
           h("div", { className: "hermes-kanban-card-title" },
             t.title || tx(i18n, "untitled", "(untitled)")),
