@@ -1688,6 +1688,40 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
         return int(cur.lastrowid or 0)
 
 
+def _receipt_comment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    action_da: str,
+    author: Optional[str],
+    *,
+    reason: Optional[str] = None,
+) -> None:
+    """Write a receipt comment for a successful action.
+
+    Format: "<Action> af <bruger> kl. <tid>" (e.g. "Arkiveret af user kl. 2026-10-07 14:30").
+    If the comment cannot be written, log a warning but do NOT fail the action.
+    """
+    if not author or not author.strip():
+        return
+    try:
+        now = int(time.time())
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
+        body = f"{action_da} af {author.strip()} kl. {ts}"
+        if reason:
+            body += f" — {reason}"
+        # Use a nested txn so a comment failure never rolls back the main action.
+        with write_txn(conn, allow_nested=True):
+            _require_task(conn, task_id)
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (task_id, author.strip(), body, now),
+            )
+            _append_event(conn, task_id, "commented", {"author": author, "len": len(body), "receipt": True})
+    except Exception as exc:
+        # Best-effort: log and continue. The action already succeeded.
+        _log.warning("Failed to write receipt comment for %s on %s: %s", action_da, task_id, exc)
+
+
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
     if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
         raise ValueError(f"unknown task {task_id}")
@@ -3790,7 +3824,7 @@ def specify_triage_task(
     return True
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
+def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, author: Optional[str] = None) -> bool:
     """Archive a task; a *running* task's host-local worker is terminated.
 
     Clearing ``worker_pid`` in the DB alone left the OS process running past its
@@ -3834,6 +3868,69 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     recompute_ready(conn)
     # Reap the workspace on archive too (never-completed tasks kept it forever).
     _cleanup_workspace(conn, task_id)
+    _receipt_comment(conn, task_id, "Arkiveret", author)
+    return True
+
+
+def unarchive_task(conn: sqlite3.Connection, task_id: str, *, author: Optional[str] = None) -> bool:
+    """Restore an archived task to active status (ready/todo based on parents).
+
+    Reverses the archive operation: sets status back to 'ready' if all parents
+    are terminal (done/archived), otherwise 'todo'. Preserves all task data,
+    comments, events, links, and attachments. The task becomes dispatchable again.
+
+    Because ``archived`` counts as terminal for dependency gating, a child may
+    have been promoted to ``ready``/``review`` while this task was archived.
+    Reopening the task makes it non-terminal again, so any *unclaimed* child
+    whose parents are no longer satisfied is returned to the ``todo`` gate
+    (mirroring :func:`claim_task` / :func:`claim_review_task`, which would
+    otherwise reject and demote it on the next tick). Running children are
+    left untouched.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] != "archived":
+            return False  # Only archived tasks can be unarchived
+
+        # Determine target status based on parent satisfaction (same logic as create_task)
+        target_status = "ready" if _parents_satisfied(conn, task_id) else "todo"
+
+        cur = conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ? AND status = 'archived'",
+            (target_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+
+        _append_event(conn, task_id, "unarchived", {"status": target_status})
+
+        # Re-gate children this reopen un-satisfied: a child promoted while the
+        # parent was archived returns to 'todo' if it is still unclaimed.
+        child_rows = conn.execute(
+            "SELECT t.id, t.status FROM tasks t "
+            "JOIN task_links l ON l.child_id = t.id "
+            "WHERE l.parent_id = ? AND t.status IN ('ready', 'review') "
+            "AND t.claim_lock IS NULL",
+            (task_id,),
+        ).fetchall()
+        for child in child_rows:
+            if not _parents_satisfied(conn, child["id"]):
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = ?",
+                    (child["id"], child["status"]),
+                )
+                _append_event(
+                    conn, child["id"], "dependency_wait",
+                    {"reason": "parent_reopened", "source_status": child["status"]},
+                )
+
+    # Unarchived parent may now block children; re-evaluate promotion.
+    recompute_ready(conn)
+    _receipt_comment(conn, task_id, "Genåbnet fra arkiv", author)
     return True
 
 

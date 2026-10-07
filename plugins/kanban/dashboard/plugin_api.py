@@ -641,6 +641,8 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     s = payload.status
     if s == "archived":
         ok = kanban_db.archive_task(conn, task_id)
+    elif s == "unarchived":
+        ok = kanban_db.unarchive_task(conn, task_id)
     else:
         with _map_errors(400, _StatusRejected, ValueError):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
@@ -834,7 +836,10 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
         entry.update(ok=False, error="archive refused")
     if payload.status is not None and not payload.archive:
         s = payload.status
-        if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
+        if s == "unarchived":
+            if not kanban_db.unarchive_task(conn, tid):
+                entry.update(ok=False, error="unarchive refused (must be archived)")
+        elif not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
             entry.update(ok=False, error=_open_parent_refusal(conn, tid, s) or f"transition to {s!r} refused")
     if payload.assignee is not None:
         try:

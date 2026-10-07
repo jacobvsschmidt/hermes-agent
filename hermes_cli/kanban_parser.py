@@ -359,6 +359,9 @@ _SPECS = [
         _arg("--rm", dest="purge_ids", nargs="+",
              help="Permanently delete already-archived task ids from the board"),
     ], help="Archive one or more tasks"),
+    _cmd("unarchive", [
+        _arg("task_ids", nargs="+", help="Archived task ids to restore to active status"),
+    ], help="Restore one or more archived tasks to active status (ready/todo)"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
     _cmd("dispatch", [
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),
