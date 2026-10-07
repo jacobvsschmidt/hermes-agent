@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from fastapi import (
-    APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
+    APIRouter, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -140,6 +140,22 @@ def _require_ok(ok: bool) -> None:
     """404 when a kanban_db mutator reports the task vanished mid-request."""
     if not ok:
         raise HTTPException(status_code=404, detail="task not found")
+
+
+def _actor(request: Optional[Request]) -> str:
+    """Who performed the card action — used for the receipt comment.
+
+    The dashboard may forward the signed-in user in ``X-Hermes-User`` (falling
+    back to ``X-Hermes-Actor``); a bare API client that sends neither is
+    recorded as ``dashboard``. Returns ``"dashboard"`` rather than ``""`` so a
+    receipt is always written (an empty author would suppress it silently).
+    """
+    if request is not None:
+        for header in ("x-hermes-user", "x-hermes-actor"):
+            value = (request.headers.get(header) or "").strip()
+            if value:
+                return value
+    return "dashboard"
 
 
 def _conflict(detail: str) -> HTTPException:
@@ -635,14 +651,15 @@ _OVERRIDE_OPS = (
 )
 
 
-def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_deferred: bool) -> None:
+def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_deferred: bool,
+                  actor: Optional[str] = None) -> None:
     """PATCH status phase: 400 on a rejected verb, 409 when the transition is refused
     (naming the blocking parent(s) for ``ready``/``done``/``review`` so the UI renders an actionable toast)."""
     s = payload.status
     if s == "archived":
-        ok = kanban_db.archive_task(conn, task_id)
+        ok = kanban_db.archive_task(conn, task_id, author=actor)
     elif s == "unarchived":
-        ok = kanban_db.unarchive_task(conn, task_id)
+        ok = kanban_db.unarchive_task(conn, task_id, author=actor)
     else:
         with _map_errors(400, _StatusRejected, ValueError):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
@@ -692,9 +709,10 @@ def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Option
 
 
 @router.patch("/tasks/{task_id}")
-def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
+def update_task(task_id: str, payload: UpdateTaskBody, request: Request, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn):
         _require_task(conn, task_id)
+        actor = _actor(request)
         # For a combined assignee+review patch, request_review must capture the
         # current implementer before the task is routed to the reviewer.
         review_assignee_deferred = payload.status == "review" and payload.assignee is not None
@@ -702,7 +720,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             with _map_errors(409, RuntimeError):
                 _require_ok(kanban_db.assign_task(conn, task_id, payload.assignee or None))
         if payload.status is not None:
-            _patch_status(conn, task_id, payload, review_assignee_deferred)
+            _patch_status(conn, task_id, payload, review_assignee_deferred, actor=actor)
         for wanted, apply, _refused in _OVERRIDE_OPS:
             if wanted(payload):
                 with _map_errors(400, ValueError, RuntimeError):
@@ -719,11 +737,19 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
 
 @router.delete("/tasks/{task_id}")
-def delete_task(task_id: str, board: Optional[str] = Query(None)):
+def delete_task(task_id: str, request: Request, board: Optional[str] = Query(None)):
+    """Remove a card = reversible archive (soft delete), never a silent hard delete.
+
+    ``hermes kanban delete`` is not a command — the removal path IS archive. The
+    card survives (retrievable, un-archivable) and the action records a receipt
+    comment so "who removed this" is never lost.
+    """
     with _board_conn(board) as (board, conn):
-        if not kanban_db.delete_task(conn, task_id):
+        if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        return {"deleted": True, "task_id": task_id}
+        if not kanban_db.archive_task(conn, task_id, author=_actor(request)):
+            raise HTTPException(status_code=409, detail=f"task {task_id} is already archived")
+        return {"archived": True, "task_id": task_id}
 
 
 def _parents_blocking_ready(conn: sqlite3.Connection, task_id: str) -> list:
@@ -829,15 +855,16 @@ def delete_link(parent_id: str = Query(...), child_id: str = Query(...), board: 
         return {"ok": bool(kanban_db.unlink_tasks(conn, parent_id, child_id))}
 
 
-def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str], entry: dict) -> None:
+def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str], entry: dict,
+                    actor: Optional[str] = None) -> None:
     """Apply the bulk patch to one task, recording refusals in ``entry`` without aborting the
     remaining ops — except a rejected status verb (``_StatusRejected`` propagates)."""
-    if payload.archive and not kanban_db.archive_task(conn, tid):
+    if payload.archive and not kanban_db.archive_task(conn, tid, author=actor):
         entry.update(ok=False, error="archive refused")
     if payload.status is not None and not payload.archive:
         s = payload.status
         if s == "unarchived":
-            if not kanban_db.unarchive_task(conn, tid):
+            if not kanban_db.unarchive_task(conn, tid, author=actor):
                 entry.update(ok=False, error="unarchive refused (must be archived)")
         elif not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
             entry.update(ok=False, error=_open_parent_refusal(conn, tid, s) or f"transition to {s!r} refused")
@@ -861,12 +888,13 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
 
 
 @router.post("/tasks/bulk")
-def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
+def bulk_update(payload: BulkTaskBody, request: Request, board: Optional[str] = Query(None)):
     """Apply the same patch to every id. Independent iteration — per-task
     failures don't abort siblings; returns per-id outcome for partials."""
     ids = [i for i in (payload.ids or []) if i]
     if not ids:
         raise HTTPException(status_code=400, detail="ids is required")
+    actor = _actor(request)
     results: list[dict] = []
     with _board_conn(board) as (board, conn):
         for tid in ids:
@@ -875,7 +903,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 if kanban_db.get_task(conn, tid) is None:
                     entry.update(ok=False, error="not found")
                 else:
-                    _bulk_apply_one(conn, tid, payload, board, entry)
+                    _bulk_apply_one(conn, tid, payload, board, entry, actor)
             except Exception as e:  # one bad id shouldn't kill the batch (incl. _StatusRejected)
                 entry.update(ok=False, error=str(e))
             results.append(entry)

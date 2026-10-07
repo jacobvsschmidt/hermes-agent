@@ -435,20 +435,27 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
 # ---------------------------------------------------------------------------
 
 def test_delete_task(client):
+    """DELETE = reversible archive (soft delete): the card survives, is
+    retrievable, and can be un-archived — never a silent hard delete."""
     t = client.post("/api/plugins/kanban/tasks", json={"title": "to-delete"}).json()["task"]
     r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
     assert r.status_code == 200
-    assert r.json()["deleted"] is True
+    assert r.json()["archived"] is True
     assert r.json()["task_id"] == t["id"]
 
-    # Gone from board
+    # Hidden from the default board...
     board = client.get("/api/plugins/kanban/board").json()
     all_ids = [tt["id"] for col in board["columns"] for tt in col["tasks"]]
     assert t["id"] not in all_ids
 
-    # Gone from detail
+    # ...but still there, archived, and reversible.
     r = client.get(f"/api/plugins/kanban/tasks/{t['id']}")
-    assert r.status_code == 404
+    assert r.status_code == 200, "removal must archive, not hard-delete"
+    assert r.json()["task"]["status"] == "archived"
+
+    back = client.patch(f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "unarchived"})
+    assert back.status_code == 200, back.text
+    assert client.get(f"/api/plugins/kanban/tasks/{t['id']}").json()["task"]["status"] == "ready"
 
 # ---------------------------------------------------------------------------
 # Comments + Links
