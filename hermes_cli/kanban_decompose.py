@@ -93,6 +93,25 @@ the default_assignee.
 No preamble, no closing remarks, no code fences. Output only the JSON object.
 """
 
+# Appended to the system prompt when the board opts into the MAALING gate
+# (kanban.require_maaling, t_cd4fdff8): every child body — and the single-task
+# body — must carry the marker, or create_task/specify_triage_task refuse it.
+_MAALING_INSTRUCTION = """
+
+BOARD RULE — MAALING: the board refuses any card whose body lacks a measurable
+acceptance test. EVERY child body (and the single-task body when fanout=false)
+MUST contain a section headed MAALING (or Måling) followed by the concrete test
+that proves the change worked: the exact command/metric to run and the expected
+result. A body without that marker is rejected at creation.
+"""
+
+
+def _system_prompt() -> str:
+    """The decomposer prompt, plus the MAALING contract when the board opts in."""
+    from hermes_cli.kanban_db_maaling import maaling_gate_enabled
+
+    return _SYSTEM_PROMPT + _MAALING_INSTRUCTION if maaling_gate_enabled() else _SYSTEM_PROMPT
+
 
 _USER_TEMPLATE = """Task id: {task_id}
 Title: {title}
@@ -315,7 +334,7 @@ def decompose_task(
 
     routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(
-        "decompose", task_id, aux_task="kanban_decomposer", system=_SYSTEM_PROMPT,
+        "decompose", task_id, aux_task="kanban_decomposer", system=_system_prompt(),
         user=_USER_TEMPLATE.format(
             **_task_prompt_fields(task),
             roster=_format_roster(routing.roster),

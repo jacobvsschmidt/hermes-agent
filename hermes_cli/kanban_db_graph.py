@@ -196,6 +196,12 @@ def _insert_decomposed_child(
         child_ws_path = None
     new_id = _new_task_id()
     body = child.get("body")
+    # Fail-closed MAALING gate (t_cd4fdff8): decompose children are inserted here
+    # directly (they never pass create_task), so the child body must carry the
+    # marker when the board opts in — otherwise the child lands in todo without a
+    # measurable test. The decomposer prompt is told to emit it.
+    from hermes_cli.kanban_db_maaling import enforce_maaling
+    enforce_maaling(body if isinstance(body, str) else None, verb="decompose child")
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, workspace_kind, "
