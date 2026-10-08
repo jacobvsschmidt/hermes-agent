@@ -1912,6 +1912,15 @@ DEFAULT_CONFIG = {
         # Assignee when the orchestrator can't match one to an installed profile; "" = default
         # profile. A task never ends up with assignee=None.
         "default_assignee": "",
+        # Refuse (fail-closed) any new card whose body lacks a MAALING/Måling
+        # section — a measurable acceptance test. Enforced in create_task and in
+        # specify_triage_task, so it covers the `hermes kanban create` CLI, the
+        # kanban_create agent tool, the swarm builder, the auto-decomposer and
+        # triage promotion; the decomposer/specifier prompts are told to emit the
+        # marker when this is on. Off by default: the MAALING convention is a
+        # board policy, not a Hermes-wide invariant. The marker is the same one
+        # the retro metric nye_kort_uden_maaling counts.
+        "require_maaling": False,
         # Global cap: positive int = the HOST never has more than N tasks 'running' across all
         # boards and both dispatch lanes. None = ~MemTotal / 512 MiB clamped to [2, 8]; where
         # MemTotal is unreadable (macOS/Windows) None means no cap.

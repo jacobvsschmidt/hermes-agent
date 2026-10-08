@@ -1258,6 +1258,11 @@ def create_task(
         if row:
             return row["id"]
 
+    # Fail-closed MAALING gate (t_cd4fdff8): every create path — CLI, agent tool,
+    # swarm, auto-decomposer — mints cards here; inert unless kanban.require_maaling.
+    from hermes_cli.kanban_db_maaling import enforce_maaling
+    enforce_maaling(body)
+
     now = int(time.time())
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
@@ -3769,6 +3774,11 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
+        # Fail-closed MAALING gate (t_cd4fdff8): a triage promotion lands in
+        # todo/ready, where the retro metric counts it — so the effective body
+        # (the new one, else the card's current one) must carry a MAALING.
+        from hermes_cli.kanban_db_maaling import enforce_maaling
+        enforce_maaling(body if body is not None else existing["body"], verb="specify task")
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
