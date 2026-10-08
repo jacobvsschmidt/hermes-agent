@@ -582,7 +582,9 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
     ``review_reopened`` event) instead of a raw write; ``triage`` needs no current-state query."""
     current = kanban_db.get_task(conn, task_id) if s != "triage" else None
     if s == "ready" and current and current.status in ("blocked", "scheduled"):
-        return kanban_db.unblock_task(conn, task_id)
+        # A dashboard drag is a deliberate HUMAN action, so it may lift a
+        # 'needs_input' escalation; automated callers must not (t_e3cf9fcc).
+        return kanban_db.unblock_task(conn, task_id, allow_needs_input=True, actor="dashboard")
     if current is not None and current.status == "review":
         return kanban_db.reopen_review_task(conn, task_id)
     return _set_status_direct(conn, task_id, s)

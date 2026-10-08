@@ -3576,11 +3576,57 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def _needs_input_block(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the card's ACTIVE block is a ``needs_input`` human escalation.
+
+    Reads the typed state left by :func:`block_task` (``tasks.block_kind``) and
+    falls back to the newest ``blocked`` event payload for a card whose column
+    was never populated (direct DB edit). A ``needs_input`` block exists for a
+    HUMAN to answer, so an automated ``unblock`` must never lift it silently —
+    otherwise a card that says "waiting for you" is swept back into the lanes and
+    the escalation never reaches the operator (board-integrity, t_e3cf9fcc).
+    """
+    row = conn.execute("SELECT block_kind FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if _row_get(row, "block_kind") == "needs_input":
+        return True
+    ev = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    return _json_dict(_row_get(ev, "payload")).get("kind") == "needs_input"
+
+
+def unblock_task(
+    conn: sqlite3.Connection, task_id: str, *,
+    allow_needs_input: bool = False, actor: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+    when that is where it left off), closing any leaked run first.
+
+    A ``needs_input`` block is a human escalation and is only lifted when the
+    caller passes an EXPLICIT human authorisation (``allow_needs_input=True``).
+    An automated sweep that omits it is refused fail-closed and gets a visible
+    ``unblock_refused`` event instead of a silent transition (t_e3cf9fcc). The
+    ``unblocked`` event carries ``actor``/``reason`` when supplied, so no unblock
+    is left without a trace of who did it and why.
+    """
     now = int(time.time())
     with write_txn(conn):
+        if (
+            _task_status(conn, task_id) == "blocked"
+            and not allow_needs_input
+            and _needs_input_block(conn, task_id)
+        ):
+            _append_event(conn, task_id, "unblock_refused", {
+                "kind": "needs_input",
+                "actor": actor,
+                "reason": reason or (
+                    "needs_input requires an explicit human authorisation "
+                    "(allow_needs_input=True)"
+                ),
+            })
+            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -3609,14 +3655,16 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
+        payload: dict[str, Any] = (
+            {"status": new_status, "resume_status": resume_status}
+            if new_status != "ready" or resume_status != "ready"
+            else {}
         )
+        if actor:
+            payload["actor"] = actor
+        if reason:
+            payload["reason"] = reason
+        _append_event(conn, task_id, "unblocked", payload or None)
         return True
 
 

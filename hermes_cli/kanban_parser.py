@@ -330,6 +330,10 @@ _SPECS = [
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
+        _arg("--force", action="store_true",
+             help="Acknowledge a HUMAN decision: lift a 'needs_input' escalation. "
+                  "Without it a needs_input block is refused (fail-closed) so an "
+                  "automated sweep cannot sweep a card that waits for a person."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
     _cmd("request-review", [

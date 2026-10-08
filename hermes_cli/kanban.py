@@ -1024,12 +1024,19 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     if rc:
         return rc
     reason = _stripped_or_none(getattr(args, "reason", None))
+    force = bool(getattr(args, "force", False))
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+        # A ``needs_input`` block is a human escalation: it is only lifted when the
+        # caller passes the explicit ``--force`` acknowledgement (t_e3cf9fcc).
+        # An automated sweep that omits it is refused fail-closed, so a card that
+        # says "waiting for you" cannot be quietly swept back into the lanes.
+        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(
+            conn, tid, allow_needs_input=force, actor=author, reason=reason))
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled, "
+                                       f"or a needs_input escalation needs --force)")
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
