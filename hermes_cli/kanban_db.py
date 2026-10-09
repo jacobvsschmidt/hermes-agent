@@ -1168,6 +1168,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    start_authorized: bool = False,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1179,6 +1180,11 @@ def create_task(
     worker model (provider requires model); ``reasoning_effort`` is independent.
     ``creator_task_id``: inherit durable session/subscriptions independently of
     dependency edges; an explicit ``session_id`` still wins.
+    ``start_authorized``: records REGEL 2/3 intent on the created event as
+    ``\"start\": <bool>`` — True only when the creator explicitly authorized an
+    auto-start (``--start``, or ``--plan`` whose title matched today's plan).
+    Defaults False so self-created fleet cards are parked; the dispatcher guard
+    reads this marker plus plan membership before ever starting a worker.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
@@ -1321,6 +1327,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "start": bool(start_authorized),
                     },
                 )
                 if task_status == "blocked":
@@ -4446,6 +4453,16 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
     ).fetchall()
     return {r["task_id"]: r["started_at"] for r in rows}
 
+
+# --- Worker-context renderers (split out; imports this module as ``_kb``) ---
+from hermes_cli.kanban_db_context import (  # noqa: E402
+    _ctx_attachments,
+    _ctx_comments,
+    _ctx_header,
+    _ctx_parent_results,
+    _ctx_prior_attempts,
+    _ctx_role_history,
+)
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
 # --- Worker-context renderers (split out; imports this module as ``_kb``) ---

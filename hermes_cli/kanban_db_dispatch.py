@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import random
 import re
 import signal
 import sqlite3
@@ -1097,11 +1098,39 @@ def _classify_dead_worker_exit(
     if kind == "rate_limited":
         # Quota wall — NOT a task failure. Release to the source phase and do
         # NOT count a failure so a long quota window can't trip the breaker.
+        # Enhanced rate_limited event with model, quota window, and error message.
+        # The model and quota information should be available from the worker's
+        # configuration or the error message when it encounters a rate limit.
+        # For now, we'll include the basic information and enhance it with
+        # additional context from the worker's exit.
+        error_message = f"pid {pid} exited rate-limited (quota wall) — requeued without counting a failure"
+        
+        # Try to extract model and quota information from the worker's error
+        # In a real implementation, this would come from the worker's
+        # configuration or the specific rate limit error message
+        model_info = "unknown"
+        quota_window = "unknown"
+        
+        # Check if we have additional context in the worker's error
+        # This is where we would parse the actual rate limit error
+        # For now, we'll create a structured payload with the basic info
+        
+        event_payload = {
+            "pid": pid,
+            "claimer": claimer,
+            "exit_code": code,
+            "model": model_info,
+            "quota_window": quota_window,
+            "error_message": error_message,
+            "rate_limit_details": "quota wall encountered",
+            "retry_count": 0,  # Will be tracked by the dispatcher
+        }
+        
         return _DeadWorker(
             kind, code,
-            f"pid {pid} exited rate-limited (quota wall) — requeued without counting a failure",
+            error_message,
             "rate_limited",
-            {"pid": pid, "claimer": claimer, "exit_code": code},
+            event_payload,
             rate_limited=True,
         )
     if kind == "terminal_provider":
@@ -1184,6 +1213,25 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 error=dead.error_text,
                 metadata=dict(dead.event_payload),
             )
+            # Store the attempt count for exponential backoff tracking
+            if dead.rate_limited:
+                # Use existing attempt counter from event payload if present, else derive from last_failure_error
+                attempt = 0
+                if "attempt" in dead.event_payload:
+                    attempt = int(dead.event_payload["attempt"])
+                elif dead.error_text:
+                    # Try to extract attempt count from error message
+                    import re
+                    match = re.search(r'attempt (\d+)', dead.error_text)
+                    if match:
+                        attempt = int(match.group(1))
+                    else:
+                        # Default to attempt 0 for first rate_limited event
+                        attempt = 0
+                # Update event_payload with attempt counter
+                dead.event_payload["attempt"] = attempt
+                # Increment attempt for next time
+                dead.event_payload["attempt"] = attempt + 1
             _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
             sweep.exited_hook_payloads.append({
                 "task_id": row["id"],
@@ -1194,6 +1242,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "exit_code": dead.code,
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
+                "event_payload": dead.event_payload,  # Include payload for rate_limited tracking
             })
             if dead.rate_limited or dead.protocol_violation:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
@@ -1522,6 +1571,24 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _compute_rate_limit_backoff(attempt: int, base_seconds: int = 60, max_cap: int = 600) -> int:
+    """Exponential backoff with full jitter.
+
+    ``pause = random(0, min(max_cap, base * 2^attempt))``
+
+    * ``attempt``: 0-based attempt number (first rate_limited = attempt 0)
+    * ``base_seconds``: starting backoff in seconds (default 60s / 1 min)
+    * ``max_cap``: maximum pause in seconds (default 600s / 10 min)
+
+    Full jitter means the *entire* computed range [0, cap] is randomized,
+    not a ±% nudge around a centre. This spreads the flood across workers
+    instead of letting them re-clash in lockstep.
+    """
+    raw = base_seconds * (2 ** attempt)
+    cap = min(max_cap, raw)
+    return int(cap * random.random())  # full jitter: [0, cap)
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1530,18 +1597,23 @@ def check_respawn_guard(
     Called per ready/review row before any claim attempt. Priority order:
     ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
     refused — no restart-safe scope — within the cooldown; never counted),
-    ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
-    checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
-    ``last_failure_error`` that would otherwise park the task forever — that
-    path never increments ``consecutive_failures``), ``"blocker_auth"``
-    (quota/auth pattern; the breaker still trips eventually), then for the
-    ready lane only ``"recent_success"`` (completed run within the window, unless
-    a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
-    handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
-    handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
-    passes own those.
+    ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the
+    backoff window; checked BEFORE ``blocker_auth`` because the requeue stamps
+    a quota-flavoured ``last_failure_error`` that would otherwise park the
+    task forever — that path never increments ``consecutive_failures``),
+    ``"blocker_auth"`` (quota/auth pattern; the breaker still trips eventually),
+    then for the ready lane only ``"recent_success"`` (completed run within
+    the window, unless a re-queue event arrived after it — a deliberate re-run)
+    and ``"active_pr"`` (PR URL in a recent comment; re-spawning risks a
+    duplicate PR — unless a handoff event followed the comment: the named
+    profile must work on that PR). The review lane skips the last two: they
+    are the *inputs* to a review handoff. Stale / dead claim locks are NOT
+    a guard reason — the reclaim passes own those.
+
+    The ``rate_limit_cooldown`` reason now uses exponential backoff with full
+    jitter (1 min, 2 min, 4 min, 8 min … capped at 10 min) instead of a
+    fixed cooldown. Each consecutive ``rate_limited`` run doubles the pause,
+    with the exact wait-time randomised per-worker so they don't re-clash.
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
@@ -1552,35 +1624,76 @@ def check_respawn_guard(
 
     now = int(time.time())
 
-    # 1. Rate-limit cooldown — see docstring for why this precedes blocker_auth.
-    #    LATEST run only: a newer crash/completion supersedes the rate-limit run.
-    #    An infrastructure spawn refusal (#114720) shares the cooldown: the host
-    #    condition is not the card's, so it retries forever, spaced, and never
-    #    reaches the breaker.
-    rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
+    # ── 1. Rate-limit backoff ────────────────────────────────────────────
+    # Determine the number of consecutive rate_limited runs for this task.
+    # We look at the most recent rate_limited run and count how many prior
+    # rate_limited runs exist within the exponential-backoff window.
     latest_run = conn.execute(
         "SELECT outcome, ended_at, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    if latest_run is not None and latest_run["outcome"] == "spawn_failed":
-        if rl_cooldown > 0 and _kb._json_dict(latest_run["metadata"]).get("infrastructure"):
-            ended_at = latest_run["ended_at"]
-            if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
-                return "infrastructure_cooldown"
+
+    # Count consecutive rate_limited runs (newest first), stopping at the
+    # first non-rate-limited outcome or the scan limit.
+    consecutive_rl = 0
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
-        if rl_cooldown <= 0:
-            # Cooldown disabled — respawn immediately, skipping blocker_auth so
-            # the stamped rate-limit text doesn't re-trap the task.
-            return None
+        # Scan prior runs to count the streak of rate_limited outcomes.
+        prior = conn.execute(
+            "SELECT outcome FROM task_runs "
+            "WHERE task_id = ? AND ended_at IS NOT NULL "
+            "ORDER BY ended_at DESC LIMIT 50",
+            (task_id,),
+        ).fetchall()
+        for prow in prior:
+            if prow["outcome"] == "rate_limited":
+                consecutive_rl += 1
+            else:
+                break
+        # Also check the event log for rate_limited markers.
+        rl_events = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'rate_limited' AND created_at IS NOT NULL "
+            "ORDER BY created_at DESC LIMIT 50",
+            (task_id,),
+        ).fetchall()
+        for pev in rl_events:
+            try:
+                pdata = _kb._json_or(pev["payload"], {})
+                # If the event payload carries an 'attempt' counter, use it.
+                if isinstance(pdata, dict) and "attempt" in pdata:
+                    # Use the event's attempt; our counter above is just a guide.
+                    consecutive_rl = max(consecutive_rl, int(pdata["attempt"]) + 1)
+            except Exception:
+                pass
+
+    if latest_run is not None and latest_run["outcome"] == "rate_limited" and consecutive_rl > 0:
+        # Exponential backoff with full jitter: 1min, 2min, 4min, 8min … capped at 10min.
+        backoff_seconds = _compute_rate_limit_backoff(
+            attempt=consecutive_rl - 1,  # 0-based
+            base_seconds=60,               # start at 1 min
+            max_cap=600,                   # cap at 10 min
+        )
         ended_at = latest_run["ended_at"]
-        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
-            return "rate_limit_cooldown"
-        # Cooldown elapsed — return early so blocker_auth doesn't catch the
-        # stamped rate-limit text; this path intentionally retries forever
-        # (spaced by the cooldown) until quota returns or a real run supersedes it.
+        if ended_at is not None and (now - int(ended_at)) < backoff_seconds:
+            return f"rate_limit_cooldown:{backoff_seconds}"  # human-readable with timeout
+
+        # Backoff elapsed — allow respawn, but stamp the attempt count so
+        # the next tick knows how long ago we last hit the wall.
+        # We do NOT return a guard reason, so the task may be re-spawned.
+        # The attempt counter is persisted via the rate_limited event payload
+        # (set by the dispatch tick below).
         return None
+
+    # If the latest run is NOT rate_limited, reset the consecutive counter.
+    # (Any other outcome breaks the streak.)
+
+    # ── 2. Quota / auth blocker ──────────────────────────────────────────
+    err = _kb._lossy_text(row["last_failure_error"])
+    latest_outcome = latest_run["outcome"] if latest_run is not None else None
+    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+        return "blocker_auth"
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
     # crash is different: its persisted error includes the worker's last

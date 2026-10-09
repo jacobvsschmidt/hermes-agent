@@ -105,6 +105,14 @@ Rules:
   - When unsure whether two tasks are independent, prefer the dependency edge.
     A child that waits slightly too long is recoverable; a review/verify that
     runs before its implementation is not.
+  - If you write a prerequisite into a child's body — a marker line such as
+    "FORUDSÆTNING: <other task> er landet" / "Prerequisite: <other task> has
+    landed" / "Afhænger af: <other task>" — you MUST also list the task that
+    produces that prerequisite in this child's "parents". A body that declares
+    a dependency while carrying no parent edge is a CONTRACT VIOLATION: the
+    dispatcher would run the child in parallel with the work it presupposes.
+    Emit the marker and the parent edge together, always. (This is enforced:
+    the system repairs a marker with no edge, but you should never rely on it.)
   - ONE COHERENT CHANGE TO A DEPLOYED SERVICE MUST END IN AN INTEGRATION/DEPLOY
     CARD. When two or more children are parts of the SAME change to one running
     service (e.g. a new order-signer in one card and a new order-client in
@@ -184,6 +192,25 @@ Default assignee (used when no profile fits a task): {default_assignee}
 
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+
+# A child that *declares* a prerequisite in its body ("FORUDSÆTNING: … er
+# landet", "Prerequisite: … has landed", "Afhænger af …") must carry the
+# producing sibling in its ``parents``. The LLM can encode the dependency in
+# prose yet still emit a flat, dependency-free sibling, which silently
+# parallelises work whose premises do not exist yet (t_e45b2d7e). The marker is
+# treated as authoritative: the graph is repaired so the declared edge is real.
+_PREREQ_RE = re.compile(
+    r"(?im)^\s*[>*\-\s]*(?:forudsætning(?:er)?|præmis(?:ser)?|"
+    r"prerequisite(?:s)?|prereq(?:s)?|afhængighed(?:er)?|"
+    r"dependency|dependencies|depends\s+on|afhænger\s+af)\b"
+)
+# Plural / "the parent tasks" phrasing — the child depends on EVERY preceding
+# sibling (e.g. "Forældre-taskene (klassifikation + logning) er landet").
+_PREREQ_PLURAL_RE = re.compile(
+    r"(?i)\b(?:forældre|taskene|begge|både|alle|parents|parent\s+tasks|"
+    r"siblings|both|all)\b|\+"
+)
+_TOKEN_RE = re.compile(r"[a-zæøå0-9_]{4,}")
 
 
 @dataclass
@@ -348,6 +375,78 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
     return children, ""
 
 
+def _declares_prerequisite(body: Optional[str]) -> bool:
+    """True when the child body carries a prerequisite marker line."""
+    return bool(body) and bool(_PREREQ_RE.search(body))
+
+
+def _significant_tokens(text: str) -> set[str]:
+    """Lowercased tokens of >= 4 chars, used to match a prereq to its producer."""
+    return set(_TOKEN_RE.findall((text or "").lower()))
+
+
+def _lexical_prereq_parents(idx: int, children: list[dict]) -> list[int]:
+    """Best preceding-sibling match(es) for a singular prereq reference.
+
+    Scores each earlier sibling by shared significant tokens between this
+    child's body and the sibling's title+body; returns the highest-scoring
+    sibling(s) (indices), or ``[]`` when nothing shares a token. Restricted to
+    preceding siblings so a repaired edge always points strictly leftwards and
+    can never introduce a cycle.
+    """
+    tokens = _significant_tokens(children[idx].get("body") or "")
+    if not tokens:
+        return []
+    best: list[int] = []
+    best_score = 0
+    for j in range(idx):
+        other = children[j]
+        cand = _significant_tokens(f"{other.get('title') or ''} {other.get('body') or ''}")
+        score = len(tokens & cand)
+        if score > best_score:
+            best_score, best = score, [j]
+        elif score == best_score and score > 0:
+            best.append(j)
+    return best
+
+
+def _enforce_declared_prereq_edges(children: list[dict]) -> list[dict]:
+    """Turn body-declared prerequisites into real ``parents`` edges (t_e45b2d7e).
+
+    A declared prerequisite is authoritative: a child that carries the marker
+    but has no parent edge gets one added, so the dispatcher can never start a
+    dependent sibling (a test/verify card) before the code/artifact it
+    presupposes has landed. Plural / "the parent tasks" phrasing depends on
+    every preceding sibling; a singular reference is resolved by lexical match
+    against the siblings' titles/bodies, falling back to the nearest preceding
+    sibling. A child with no preceding sibling to depend on is left untouched
+    (the premise lies outside this graph) and logged.
+    """
+    total = len(children)
+    for idx, child in enumerate(children):
+        body = child.get("body")
+        if not _declares_prerequisite(body):
+            continue
+        if child.get("parents"):
+            continue  # the LLM already encoded an edge — trust it
+        targets: list[int] = []
+        if _PREREQ_PLURAL_RE.search(body or ""):
+            targets = list(range(idx))
+        if not targets:
+            targets = _lexical_prereq_parents(idx, children)
+        if not targets and idx > 0:
+            targets = [idx - 1]
+        if targets:
+            child["parents"] = sorted(set(targets))
+        else:
+            logger.warning(
+                "decompose: child %d declares a prerequisite but has no "
+                "preceding sibling to depend on (siblings=%d); leaving as-is",
+                idx, total,
+            )
+    return children
+
+
 def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) -> DecomposeOutcome:
     raw_tasks = parsed.get("tasks") or []
     if not isinstance(raw_tasks, list) or not raw_tasks:
@@ -355,6 +454,7 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
     children, reason = _clean_children(task_id, raw_tasks, routing)
     if reason:
         return DecomposeOutcome(task_id, False, reason)
+    children = _enforce_declared_prereq_edges(children)
     try:
         with kbc.connect_closing() as conn:
             child_ids = decompose_triage_task(

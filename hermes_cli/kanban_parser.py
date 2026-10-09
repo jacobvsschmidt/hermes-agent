@@ -176,8 +176,18 @@ _SPECS = [
                   "deterministic branch. See `hermes project list`."),
         _TENANT,
         _PRIORITY,
+        _arg("--start", action="store_true",
+             help="Explicitly authorize starting a worker on this card as soon as it is "
+                  "created (Regel 2/3). Without --start or a resolvable --plan, a created "
+                  "card is parked in triage and NEVER auto-starts."),
+        _arg("--plan", action="store_true",
+             help="Authorize starting this card because it is part of today's plan "
+                  "(<plan_root>/<YYYY-MM-DD>-PLAN.md). The title must be listed in the "
+                  "plan; if it is not (or the plan cannot be resolved), the card is "
+                  "REFUSED a start and parked in triage (fail-closed)."),
         _arg("--triage", action="store_true",
-             help="Park in triage — a specifier will flesh out the spec and promote to todo"),
+             help="Explicitly park in triage — a specifier will flesh out the spec and "
+                  "promote to todo. Mutually exclusive with --start/--plan."),
         _arg("--idempotency-key",
              help="Dedup key. If a non-archived task with this key exists, "
                   "its id is returned instead of creating a duplicate."),
@@ -214,9 +224,10 @@ _SPECS = [
         _arg("--goal-max-turns", type=int, metavar="N", dest="goal_max_turns",
              help="Turn budget for --goal workers (default 20). Ignored without --goal."),
         _arg("--initial-status", choices=sorted(kb.VALID_INITIAL_STATUSES), default="running",
-             help="Initial card status. Use 'blocked' for cards "
-                  "that require immediate human ops (R3 gate) "
-                  "to skip the brief running-to-blocked transition."),
+             help="When a start IS authorized (--start/--plan), select the initial card "
+                  "status: 'running' -> ready (dispatcher picks it up), 'blocked' parks it "
+                  "for immediate human ops (R3 gate). This flag does NOT by itself "
+                  "authorize a start — without --start/--plan the card parks in triage."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     _cmd("swarm", [

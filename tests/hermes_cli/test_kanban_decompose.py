@@ -453,5 +453,153 @@ def test_system_prompt_requires_integration_deploy_and_single_host_writer():
     assert "drift" in p
 
 
+def test_system_prompt_requires_prereq_edges():
+    """Guard for t_e45b2d7e: the prompt must tell the decomposer that a
+    prerequisite marker in a child body MUST come with a matching parent edge."""
+    p = decomp._SYSTEM_PROMPT.lower()
+    assert "forudsætning" in p
+    assert "prerequisite" in p
+    assert "parents" in p
+
+
+# --- t_e45b2d7e: declared prerequisites become real parent edges ------------
+
+def _child(title, body, **kw):
+    base = {"title": title, "body": body, "assignee": None, "parents": []}
+    base.update(kw)
+    return base
+
+
+def test_enforce_prereq_edges_plural_depends_on_all_preceding():
+    """A plural reference ("Forældre-taskene (A + B) er landet") with no parent
+    edge depends on EVERY preceding sibling."""
+    children = [
+        _child("classifier", "add error_type invalid_maker_amount + bucket"),
+        _child("logging", "log signerings-parametre post-fejl: price size tick"),
+        _child(
+            "tests",
+            "FORUDSÆTNING: Forældre-taskene (klassifikation + logning) er landet.\n\nARBEJDE: unit-tests.",
+        ),
+    ]
+    out = decomp._enforce_declared_prereq_edges(children)
+    assert out[2]["parents"] == [0, 1]
+    # Untouched siblings keep no parents (still parallel).
+    assert out[0]["parents"] == [] and out[1]["parents"] == []
+
+
+def test_enforce_prereq_edges_singular_lexical_match():
+    """A singular reference ("Logning af signerings-parametre (forælder)") is
+    resolved to the preceding sibling whose title/body shares its tokens."""
+    children = [
+        _child("classifier", "add error_type invalid_maker_amount + bucket"),
+        _child("Log signerings-parametre ved place_order post-fejl", "log price size tick makerAmount"),
+        _child(
+            "reproducer",
+            "FORUDSÆTNING: Logning af signerings-parametre (forælder) er landet, "
+            "så de loggede price, size, tick og makerAmount er tilgængelige.",
+        ),
+    ]
+    out = decomp._enforce_declared_prereq_edges(children)
+    assert out[2]["parents"] == [1]
+
+
+def test_enforce_prereq_edges_keeps_llm_supplied_parents():
+    """When the LLM already encoded an edge, the repair never overrides it."""
+    children = [
+        _child("a", "x"),
+        _child("b", "y"),
+        _child("c", "FORUDSÆTNING: forælder er landet", parents=[0]),
+    ]
+    out = decomp._enforce_declared_prereq_edges(children)
+    assert out[2]["parents"] == [0]
+
+
+def test_enforce_prereq_edges_falls_back_to_nearest_preceding():
+    """A marker with no lexical overlap still gets the nearest preceding
+    sibling so the child is never emitted as a parallel sibling."""
+    children = [
+        _child("a", "alpha work"),
+        _child("b", "FORUDSÆTNING: noget helt andet er landet"),
+    ]
+    out = decomp._enforce_declared_prereq_edges(children)
+    assert out[1]["parents"] == [0]
+
+
+def test_enforce_prereq_edges_no_preceding_sibling_is_left_alone():
+    children = [_child("only", "FORUDSÆTNING: ekstern forudsætning er landet")]
+    out = decomp._enforce_declared_prereq_edges(children)
+    assert out[0]["parents"] == []
+
+
+def test_decompose_prereq_marker_becomes_parent_edge(kanban_home):
+    """Regression for t_e45b2d7e (the SAB 'invalid maker amount' split): the
+    decomposer emitted four FLAT siblings even though two of them declared a
+    prerequisite on the other two, so the test card ran in parallel and had to
+    re-implement the classifier + logging itself. After the fix the declared
+    prerequisites become parent edges and the dependent cards stay ``todo``
+    until their producers are ``done``."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="[SAB] new error class invalid maker amount", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "classifier + logging in parallel, then tests + reproducer",
+        "tasks": [
+            {"title": "classifier + alarm-bucket", "body": "add error_type invalid_maker_amount",
+             "assignee": "engineer", "parents": []},
+            {"title": "Log signerings-parametre ved place_order post-fejl",
+             "body": "log price size tick makerAmount", "assignee": "engineer", "parents": []},
+            {"title": "unit-tests",
+             "body": "FORUDSÆTNING: Forældre-taskene (klassifikation + logning) er landet.\n\nARBEJDE: tests.",
+             "assignee": "engineer", "parents": []},
+            {"title": "reproducer mod CLOB",
+             "body": "FORUDSÆTNING: Logning af signerings-parametre (forælder) er landet, "
+                     "så de loggede price, size, tick og makerAmount er tilgængelige.",
+             "assignee": "engineer", "parents": []},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orch", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is True
+    ids = outcome.child_ids
+    assert ids and len(ids) == 4
+    classifier, logging, tests, reproducer = ids
+
+    def status(conn, cid):
+        return kb.get_task(conn, cid).status
+
+    with kbc.connect() as conn:
+        # The two producers run in parallel; the dependent cards WAIT.
+        assert status(conn, classifier) == "ready"
+        assert status(conn, logging) == "ready"
+        assert status(conn, tests) == "todo"       # would be "ready" without the fix
+        assert status(conn, reproducer) == "todo"  # would be "ready" without the fix
+
+    # Complete classifier only -> tests still wait for the logging card.
+    with kbc.connect() as conn:
+        assert kb.complete_task(conn, classifier, result="done")
+    with kbc.connect() as conn:
+        assert status(conn, tests) == "todo"
+        assert status(conn, reproducer) == "todo"
+
+    # Complete logging -> both dependent cards finally promote.
+    with kbc.connect() as conn:
+        assert kb.complete_task(conn, logging, result="done")
+    with kbc.connect() as conn:
+        assert status(conn, tests) == "ready"
+        assert status(conn, reproducer) == "ready"
+
+
+
 
 
