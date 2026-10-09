@@ -78,7 +78,9 @@ def _patch_list_profiles(names: list[str]):
 
 def test_decompose_with_fanout_creates_children(kanban_home):
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="ship a feature", triage=True)
+    # start_authorized=True: mechanics test, not the REGEL 2/3 start gate
+    # (see test_kanban_start_gate.py — an unauthorized root parks in todo).
+        tid = kb.create_task(conn, title="ship a feature", triage=True, start_authorized=True)
 
     llm_payload = jsonlib.dumps({
         "fanout": True,
@@ -120,7 +122,7 @@ def test_decompose_fanout_children_inherit_root_assignee_when_unrouted(kanban_ho
     (an incognito profile with no credentials), so the old fallback spawned
     workers that deadlocked on capability blockers."""
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="ship it", assignee="zdr", triage=True)
+        tid = kb.create_task(conn, title="ship it", assignee="zdr", triage=True, start_authorized=True)
 
     llm_payload = jsonlib.dumps({
         "fanout": True,
@@ -164,7 +166,7 @@ def test_decompose_explicit_default_assignee_wins_over_root_assignee(kanban_home
     fills in when no explicit default is set (explicit config → card
     assignee → active profile)."""
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="ship it", assignee="engineer", triage=True)
+        tid = kb.create_task(conn, title="ship it", assignee="engineer", triage=True, start_authorized=True)
 
     llm_payload = jsonlib.dumps({
         "fanout": True,
