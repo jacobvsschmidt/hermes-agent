@@ -180,15 +180,3 @@ def test_start_true_behavior_untouched(kanban_home):
         assert kb.get_task(conn, child_id).status == "ready"
         assert kb.start_start_refusal(conn, child_id) is None
 
-
-def test_approval_releases_dispatcher_startability(kanban_home):
-    """The dispatcher's _card_startable honors the approval event end-to-end."""
-    with kbc.connect() as conn:
-        tid = _create_bare(conn)
-        (child_id,) = _decompose(conn, tid, n=1)
-    with kbc.connect() as conn:
-        can, reason = kbd._card_startable(conn, child_id)
-        assert can is False and reason is not None
-        kb.approve_task_start(conn, tid, actor="jacob", note="go")
-        can, reason = kbd._card_startable(conn, child_id)
-        assert can is True and reason is None

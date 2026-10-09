@@ -177,7 +177,12 @@ _SPECS = [
         _TENANT,
         _PRIORITY,
         _arg("--triage", action="store_true",
-             help="Park in triage — a specifier will flesh out the spec and promote to todo"),
+             help="Park in triage — a specifier will flesh out the spec and promote to todo. "
+                  "Mutually exclusive with --start."),
+        _arg("--start", action="store_true",
+             help="Explicitly authorize starting a worker on this card as soon as it is "
+                  "created (Regel 2/3). A bare created card records start=False and may "
+                  "never be auto-started without explicit approval."),
         _arg("--idempotency-key",
              help="Dedup key. If a non-archived task with this key exists, "
                   "its id is returned instead of creating a duplicate."),

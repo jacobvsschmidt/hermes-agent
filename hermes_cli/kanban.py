@@ -360,6 +360,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
+    # REGEL 2/3 (t_ab7f2b5d): record durable start intent. Bare create keeps
+    # its pre-existing routing; --start marks the card start-authorized.
+    start_authorized = bool(getattr(args, "start", False))
+    if start_authorized and bool(getattr(args, "triage", False)):
+        return _err("kanban create: --triage conflicts with --start (cannot both park and start)", 2)
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
             conn, title=args.title, body=body, assignee=args.assignee,
@@ -375,20 +380,23 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
             initial_status=getattr(args, "initial_status", "running"),
+            start_authorized=start_authorized,
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
         )
         task = kb.get_task(conn, task_id)
+    if task is None:  # create_task committed, so this is unreachable — satisfy the checker
+        return _err(f"kanban create: task {task_id} vanished after creation", 1)
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
-    else:
-        print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
-        # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
-        # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
-        if task.status == "ready" and task.assignee:
-            running, message = _check_dispatcher_presence()
-            if not running and message:
-                print(f"\n⚠  {message}", file=sys.stderr)
+        return 0
+    print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+    # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
+    # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
+    if task.status == "ready" and task.assignee:
+        running, message = _check_dispatcher_presence()
+        if not running and message:
+            print(f"\n⚠  {message}", file=sys.stderr)
     return 0
 
 
@@ -1348,7 +1356,7 @@ _HANDLERS = {
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "approve": _cmd_approve,
-    "archive": _cmd_archive, "unarchive": _cmd_unarchive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
+    "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,

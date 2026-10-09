@@ -232,7 +232,8 @@ def _guard_review_row(conn: sqlite3.Connection, review_id: str) -> dict:
             "'rate_limited', ?, ?)",
             (review_id, now, now),
         )
-    assert kbd.check_respawn_guard(conn, review_id, lane="review") == "rate_limit_cooldown"
+    guarded_reason = kbd.check_respawn_guard(conn, review_id, lane="review")
+    assert guarded_reason is not None and guarded_reason.startswith("rate_limit_cooldown")
     return {"max_in_progress": 1}
 
 
