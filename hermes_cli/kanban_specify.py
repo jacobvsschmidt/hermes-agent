@@ -60,24 +60,6 @@ Rules:
   - Output only the JSON object and nothing else.
 """
 
-# Appended when the board opts into the MAALING gate (kanban.require_maaling,
-# t_cd4fdff8): the promoted body must carry the marker, or specify_triage_task
-# refuses it (it lands in todo/ready, where the retro metric counts it).
-_MAALING_INSTRUCTION = """
-
-BOARD RULE — MAALING: the board refuses any card whose body lacks a measurable
-acceptance test. In addition to the sections above, the body MUST contain a
-section headed MAALING (or Måling) with the concrete test that proves the change
-worked: the exact command/metric to run and the expected result.
-"""
-
-
-def _system_prompt() -> str:
-    """The specifier prompt, plus the MAALING contract when the board opts in."""
-    from hermes_cli.kanban_db_maaling import maaling_gate_enabled
-
-    return _SYSTEM_PROMPT + _MAALING_INSTRUCTION if maaling_gate_enabled() else _SYSTEM_PROMPT
-
 
 _USER_TEMPLATE = """Task id: {task_id}
 Current title: {title}
@@ -219,7 +201,7 @@ def specify_task(
         return SpecifyOutcome(task_id, False, reason)
 
     raw, reason = _call_aux(
-        "specify", task_id, aux_task="triage_specifier", system=_system_prompt(),
+        "specify", task_id, aux_task="triage_specifier", system=_SYSTEM_PROMPT,
         user=_USER_TEMPLATE.format(**_task_prompt_fields(task)),
         max_tokens=HERMES_KANBAN_SPECIFY_MAX_TOKENS, timeout=timeout or 120,
     )
