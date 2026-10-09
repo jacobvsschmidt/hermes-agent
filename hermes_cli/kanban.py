@@ -97,6 +97,86 @@ def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
     return branch
 
 
+def _plan_root() -> Path:
+    """``$HERMES_KANBAN_PLAN_DIR`` else ``<hermes root>/inbox`` (REGEL 2/3 plan store)."""
+    override = os.environ.get("HERMES_KANBAN_PLAN_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return kb.kanban_home() / "inbox"
+
+
+def _plan_authorizes(title: Optional[str]) -> tuple[bool, Optional[str]]:
+    """Fail-closed REGEL 2/3 plan gate for ``kanban create --plan``.
+
+    A card may start under ``--plan`` only when today's plan file resolves AND
+    lists the card title. Any failure — empty title, no plan root, no file for
+    today's date, unreadable file, title absent — returns ``(False, reason)`` so
+    the caller parks the card in triage instead of auto-starting it.
+
+    Plan file: ``<plan_root>/<YYYY-MM-DD>-PLAN.md`` where ``plan_root`` is
+    ``$HERMES_KANBAN_PLAN_DIR`` else ``<hermes root>/inbox``, and the date is
+    today (local time). Title match is case-insensitive on whitespace-collapsed
+    line content, so a bare ``Title`` matches a ``- Title`` / ``## Title`` plan
+    entry.
+    """
+    if not title or not title.strip():
+        return False, "cannot match an empty title against today's plan"
+    plan = _plan_root() / f"{time.strftime('%Y-%m-%d')}-PLAN.md"
+    if not plan.is_file():
+        return False, f"today's plan not found at {plan} — refusing to start an unplanned card"
+    try:
+        text = plan.read_text(encoding="utf-8")
+    except OSError as exc:
+        return False, f"cannot read today's plan {plan}: {exc}"
+    needle = " ".join(title.strip().split()).casefold()
+    for raw in text.splitlines():
+        line = " ".join(raw.split()).casefold()
+        if needle and needle in line:
+            return True, None
+    return False, f"title {title!r} is not listed in today's plan {plan} — refusing to start"
+
+
+def _resolve_create_start(args) -> tuple[bool, str, bool, Optional[str]]:
+    """REGEL 2/3 start resolution for ``kanban create``.
+
+    Returns ``(triage, initial_status, start_authorized, park_reason)``.
+
+    Fail-closed semantics (the dispatcher guard and tests rely on these):
+      * no ``--start``/``--plan`` beacon -> the card is PARKED (``triage=True``;
+        ``--initial-status blocked`` R3 gate is preserved as a no-spawn park).
+      * ``--start`` -> authorized start; legacy ``initial_status`` rules apply.
+      * ``--plan`` only -> starts ONLY if :func:`_plan_authorizes` resolves the
+        title against today's plan; otherwise parks in triage with the reason.
+      * ``--start --plan`` together -> ``--start`` wins (it is the unqualified
+        explicit start; ``--plan`` is redundant).
+      * ``--triage`` combined with a beacon is ambiguous -> caller errors out.
+    """
+    start_flag = bool(getattr(args, "start", False))
+    plan_flag = bool(getattr(args, "plan", False))
+    wants_triage = bool(getattr(args, "triage", False))
+    initial_status = getattr(args, "initial_status", "running")
+
+    if wants_triage and (start_flag or plan_flag):
+        raise ValueError("--triage conflicts with --start/--plan (cannot both park and start); "
+                         "drop --triage to start, or drop --start/--plan to park")
+
+    explicit_start = start_flag or plan_flag
+    if not explicit_start:
+        # Bare create (REGEL 2): park; never ready/running. The R3 gate
+        # ``--initial-status blocked`` is itself a no-spawn park and is kept.
+        if initial_status == "blocked":
+            return False, "blocked", False, None
+        return True, initial_status, False, None
+
+    if plan_flag and not start_flag:
+        ok_start, reason = _plan_authorizes(getattr(args, "title", None))
+        if ok_start:
+            return False, initial_status, True, None
+        return True, initial_status, False, reason  # fail closed -> park in triage
+    # --start (with or without --plan) is the unqualified explicit start.
+    return False, initial_status, True, None
+
+
 def _check_dispatcher_presence(hermes_home: Optional[Path] = None) -> tuple[bool, str]:
     """``(running, message)`` for the "will anything dispatch this?" warning: True when a gateway is
     alive for this HERMES_HOME with ``kanban.dispatch_in_gateway`` on, else False + human guidance.
@@ -360,35 +440,56 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
-    with kbc.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn, title=args.title, body=body, assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
-            project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
-            parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
-            idempotency_key=getattr(args, "idempotency_key", None),
-            max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries, model_override=getattr(args, "model_override", None),
-            provider_override=getattr(args, "provider_override", None),
-            goal_mode=bool(getattr(args, "goal_mode", False)),
-            goal_max_turns=getattr(args, "goal_max_turns", None),
-            completion_contract=getattr(args, "completion_contract", None),
-            initial_status=getattr(args, "initial_status", "running"),
-            creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
-                             if is_dispatcher_owned_worker_context() else None),
-        )
-        task = kb.get_task(conn, task_id)
+    # REGEL 2/3 fail-closed start resolution (raises ValueError on --triage +
+    # --start/--plan ambiguity, caught below alongside the ready-owner gate).
+    try:
+        triage, initial_status, start_authorized, park_reason = _resolve_create_start(args)
+    except ValueError as exc:
+        return _err(f"kanban create: {exc}", 2)
+    try:
+        with kbc.connect_closing() as conn:
+            task_id = kb.create_task(
+                conn, title=args.title, body=body, assignee=args.assignee,
+                created_by=args.created_by or _profile_author(),
+                workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
+                project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
+                parents=tuple(args.parent or ()), triage=triage,
+                idempotency_key=getattr(args, "idempotency_key", None),
+                max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
+                max_retries=max_retries, model_override=getattr(args, "model_override", None),
+                provider_override=getattr(args, "provider_override", None),
+                goal_mode=bool(getattr(args, "goal_mode", False)),
+                goal_max_turns=getattr(args, "goal_max_turns", None),
+                completion_contract=getattr(args, "completion_contract", None),
+                initial_status=initial_status,
+                start_authorized=start_authorized,
+                creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                                 if is_dispatcher_owned_worker_context() else None),
+            )
+            task = kb.get_task(conn, task_id)
+    except ValueError as exc:
+        # Fail-closed refusals (e.g. the ready owner gate) reach the feeder as
+        # a clean CLI error, not a traceback (t_f7992f0f).
+        return _err(f"kanban create: {exc}", 2)
+    if task is None:  # create_task committed, so this is unreachable — satisfy the checker
+        return _err(f"kanban create: task {task_id} vanished after creation", 1)
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
-    else:
-        print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
-        # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
-        # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
-        if task.status == "ready" and task.assignee:
-            running, message = _check_dispatcher_presence()
-            if not running and message:
-                print(f"\n⚠  {message}", file=sys.stderr)
+        if park_reason:
+            print(f"⚠  {park_reason}", file=sys.stderr)
+        return 0
+    print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+    if park_reason:
+        # A --plan card whose title wasn't in today's plan was parked, not
+        # started — surface why so the caller can add it or pass --start.
+        print(f"⚠  {park_reason}", file=sys.stderr)
+        return 0
+    # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
+    # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
+    if task.status == "ready" and task.assignee:
+        running, message = _check_dispatcher_presence()
+        if not running and message:
+            print(f"\n⚠  {message}", file=sys.stderr)
     return 0
 
 
@@ -971,11 +1072,20 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 
 
 def _commented(conn, reason: Optional[str], author, prefix: str, op):
-    """Wrap a per-task ``op`` so a ``reason`` is first recorded as a ``PREFIX: reason`` comment."""
+    """Wrap a per-task ``op`` so a ``reason`` is recorded as a ``PREFIX: reason`` comment.
+
+    The comment is written only AFTER ``op`` reported success (t_69bbb9d5). A
+    failed block/schedule/unblock used to prepend an identical ``PREFIX: reason``
+    comment on every attempt -- so a refused op that got retried (or, before the
+    dropbox dead-letter landed, retried forever) spammed the card with comments
+    for an operation that never actually happened. Now a refused op leaves the
+    card's comment thread untouched.
+    """
     def run(tid):
-        if reason:
+        result = op(tid)
+        if result and reason:
             kb.add_comment(conn, tid, author, f"{prefix}: {reason}")
-        return op(tid)
+        return result
     return run
 
 
@@ -1119,6 +1229,25 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_approve(args: argparse.Namespace) -> int:
+    """Explicit human/Smeden start approval for a start=False card (REGEL 2/3)."""
+    reason = _joined_words(args.reason) or None
+    author = _profile_author()
+    ids = list(dict.fromkeys(_bulk_ids(args)))
+    released = 0
+    failed = []
+    with kbc.connect_closing() as conn:
+        for tid in ids:
+            ok, err = kb.approve_task_start(conn, tid, actor=author, note=reason)
+            if not ok:
+                print(f"cannot approve {tid}: {err}", file=sys.stderr)
+                failed.append(tid)
+                continue
+            released += kb.recompute_ready(conn)
+            print(f"Approved start for {tid}" + (f": {reason}" if reason else ""))
+    return 0 if not failed else 1
+
+
 def _cmd_archive(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     purge_ids = list(getattr(args, "purge_ids", None) or [])
@@ -1126,12 +1255,23 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         return _err("choose either task_ids to archive or --rm archived task_ids")
     if not ids and not purge_ids:
         return _err("at least one task_id is required")
+    author = _profile_author()
     with kbc.connect_closing() as conn:
         if purge_ids:
             return _bulk_apply(purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
                                lambda tid: f"cannot delete {tid} (must already be archived)")
-        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
+        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid, author=author),
                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
+
+
+def _cmd_unarchive(args: argparse.Namespace) -> int:
+    ids = list(args.task_ids or [])
+    if not ids:
+        return _err("at least one task_id is required")
+    author = _profile_author()
+    with kbc.connect_closing() as conn:
+        return _bulk_apply(ids, lambda tid: kb.unarchive_task(conn, tid, author=author),
+                           lambda tid: f"Unarchived {tid}", lambda tid: f"cannot unarchive {tid} (must be archived)")
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
@@ -1330,7 +1470,8 @@ _HANDLERS = {
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
-    "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
+    "approve": _cmd_approve,
+    "archive": _cmd_archive, "unarchive": _cmd_unarchive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,

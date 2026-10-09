@@ -30,6 +30,9 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+# Fail-closed ready-lane owner gate (t_f7992f0f): lanes that are legitimate
+# owners without being spawnable profiles (pulled by other gateways).
+HUMAN_READY_LANES = frozenset({"jacob"})
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -1165,6 +1168,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    start_authorized: bool = False,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1176,6 +1180,11 @@ def create_task(
     worker model (provider requires model); ``reasoning_effort`` is independent.
     ``creator_task_id``: inherit durable session/subscriptions independently of
     dependency edges; an explicit ``session_id`` still wins.
+    ``start_authorized``: records REGEL 2/3 intent on the created event as
+    ``\"start\": <bool>`` — True only when the creator explicitly authorized an
+    auto-start (``--start``, or ``--plan`` whose title matched today's plan).
+    Defaults False so self-created fleet cards are parked; the dispatcher guard
+    reads this marker plus plan membership before ever starting a worker.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
@@ -1251,7 +1260,23 @@ def create_task(
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
+                default_applied = False
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
+                # Fail-closed ready owner gate (t_f7992f0f): a card landing in
+                # 'ready' must have a spawnable (or human-lane) owner, else it
+                # parks there forever. Empty assignee falls back to
+                # kanban.default_assignee (#27145); without either, creation
+                # is REFUSED — never silently dispatched-less.
+                if task_status == "ready":
+                    if not assignee and _ready_gate_managed():
+                        # Only a managed home fills the owner at creation;
+                        # otherwise #27145 stays a dispatcher-time decision.
+                        assignee = _default_assignee_from_config()
+                        default_applied = bool(assignee)
+                    refusal = ready_owner_refusal(assignee)
+                    if refusal:
+                        raise ValueError(f"cannot create ready task: {refusal}")
+                    assignee = _canonical_assignee(assignee)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
                 if project_obj is not None and workspace_kind == "worktree":
@@ -1302,6 +1327,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "start": bool(start_authorized),
                     },
                 )
                 if task_status == "blocked":
@@ -1310,6 +1336,13 @@ def create_task(
                         task_id,
                         "blocked",
                         {"reason": "initial_status", "status": "blocked", "actor": created_by or "user"},
+                    )
+                if task_status == "ready" and default_applied:
+                    # Parity with the dispatcher's #27145 auto-assignment:
+                    # the audit trail says the owner came from the config.
+                    _append_event(
+                        conn, task_id, "assigned",
+                        {"assignee": assignee, "source": "kanban.default_assignee"},
                     )
                 if task_status == "todo":
                     # Parked behind an open parent: record why, exactly as
@@ -1468,6 +1501,13 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
+        # Fail-closed ready owner gate (t_f7992f0f): a ready card must never
+        # be handed to a non-profile (it would rot un-dispatched); refusal
+        # names the profiles that ARE on disk so the caller can self-correct.
+        if row["status"] == "ready" and profile:
+            refusal = ready_owner_refusal(profile)
+            if refusal:
+                raise ValueError(f"cannot assign {task_id}: {refusal}")
         if row["assignee"] != profile:
             # The failure streak is per task/profile; a new profile starts fresh.
             conn.execute(
@@ -1686,6 +1726,40 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
         return int(cur.lastrowid or 0)
+
+
+def _receipt_comment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    action_da: str,
+    author: Optional[str],
+    *,
+    reason: Optional[str] = None,
+) -> None:
+    """Write a receipt comment for a successful action.
+
+    Format: "<Action> af <bruger> kl. <tid>" (e.g. "Arkiveret af user kl. 2026-10-07 14:30").
+    If the comment cannot be written, log a warning but do NOT fail the action.
+    """
+    if not author or not author.strip():
+        return
+    try:
+        now = int(time.time())
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
+        body = f"{action_da} af {author.strip()} kl. {ts}"
+        if reason:
+            body += f" — {reason}"
+        # Use a nested txn so a comment failure never rolls back the main action.
+        with write_txn(conn, allow_nested=True):
+            _require_task(conn, task_id)
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (task_id, author.strip(), body, now),
+            )
+            _append_event(conn, task_id, "commented", {"author": author, "len": len(body), "receipt": True})
+    except Exception as exc:
+        # Best-effort: log and continue. The action already succeeded.
+        _log.warning("Failed to write receipt comment for %s on %s: %s", action_da, task_id, exc)
 
 
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
@@ -2052,7 +2126,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, assignee "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -2061,6 +2135,21 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
                 continue
+            # REGEL 2/3 start gate (t_ab7f2b5d): auto-promotion never starts a
+            # card whose created lineage says start=False without approval.
+            # Decomposition stays allowed; the card stays parked until
+            # `hermes kanban approve`. One board-visible refusal event, no spam.
+            start_refusal = start_start_refusal(conn, task_id)
+            if start_refusal:
+                last = conn.execute(
+                    "SELECT kind FROM task_events WHERE task_id = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,),
+                ).fetchone()
+                if last is None or last["kind"] != _START_REFUSAL_EVENT:
+                    _append_event(
+                        conn, task_id, _START_REFUSAL_EVENT, {"reason": start_refusal},
+                    )
+                continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
@@ -2068,6 +2157,22 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
+                # Fail-closed ready owner gate (t_f7992f0f): automatic
+                # promotion never parks an ownerless card in 'ready'. It stays
+                # in its current lane with a board-visible refusal event
+                # instead of roting silently in ready.
+                if resume_status == "ready":
+                    refusal = ready_owner_refusal(row["assignee"])
+                    if refusal:
+                        last = conn.execute(
+                            "SELECT kind FROM task_events WHERE task_id = ? "
+                            "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,),
+                        ).fetchone()
+                        if last is None or last["kind"] != "ready_owner_refused":
+                            _append_event(
+                                conn, task_id, "ready_owner_refused", {"reason": refusal},
+                            )
+                        continue
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
                     # recover -> respawn -> exhaust -> block forever). The
@@ -2192,6 +2297,17 @@ def claim_task(
                 "WHERE id = ? AND status = 'ready'", (task_id,),
             )
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
+            return None
+        # REGEL 2/3 start gate (t_ab7f2b5d): claim is the last line of defense —
+        # a start=False card without approval never reaches running, even if a
+        # stale 'ready' status was written by an older writer.
+        start_refusal = start_start_refusal(conn, task_id)
+        if start_refusal:
+            conn.execute(
+                "UPDATE tasks SET status = 'todo' "
+                "WHERE id = ? AND status = 'ready'", (task_id,),
+            )
+            _append_event(conn, task_id, "claim_rejected", {"reason": start_refusal})
             return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
@@ -3474,6 +3590,140 @@ def request_changes(
     return True, implementer
 
 
+# --- REGEL 2/3 start gate (t_ab7f2b5d) --------------------------------------
+# A card created without explicit start authorization records ``"start": False``
+# on its created event (and `kanban create --help` promises it "NEVER
+# auto-starts"). Decomposition is allowed to run, but nothing may promote,
+# claim or spawn such a card (or any child decomposed from it) until a human /
+# Smeden approval is recorded via `hermes kanban approve <task_id>`.
+
+START_APPROVAL_EVENT = "start_approved"
+_START_REFUSAL_EVENT = "start_start_refused"
+_START_ORIGIN_MAX_DEPTH = 8
+
+
+def _start_flag_task_id(
+    conn: sqlite3.Connection, task_id: str, _depth: int = 0,
+) -> Optional[str]:
+    """Return the task id whose created event carries the ``start`` flag.
+
+    Decomposed children carry ``from_decompose_of`` on their created event and
+    inherit the root's start intent; follow that chain (bounded) up to the
+    origin card. ``None`` when no created event in the chain states a flag.
+    """
+    if _depth > _START_ORIGIN_MAX_DEPTH:
+        return None
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+        "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    payload = _json_dict(_row_get(row, "payload")) if row else {}
+    if "start" in payload:
+        return task_id
+    origin = payload.get("from_decompose_of")
+    if isinstance(origin, str) and origin:
+        return _start_flag_task_id(conn, origin, _depth + 1)
+    return None
+
+
+def _has_decompose_lineage(conn, task_id: str) -> bool:
+    """Whether this card belongs to an auto-decomposition tree: it is itself a
+    decompose root (a ``decomposed`` event) or was created by one. The REGEL 2/3
+    start gate binds only here — a bare triage card never moves toward running
+    on its own, and an explicit human ``promote``/``specify`` IS the approval
+    for everything outside a decomposition tree."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+        "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    payload = _json_dict(_row_get(row, "payload")) if row else {}
+    if isinstance(payload.get("from_decompose_of"), str) and payload.get("from_decompose_of"):
+        return True
+    return bool(conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'decomposed' LIMIT 1",
+        (task_id,),
+    ).fetchone())
+
+
+def _has_been_started(conn, task_id: str) -> bool:
+    """Whether the card has legitimately run at least once. After a first
+    authorized start the create-time flag no longer governs the card — rework
+    and review cycles must keep flowing."""
+    return bool(conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'claimed' LIMIT 1",
+        (task_id,),
+    ).fetchone())
+
+
+def start_start_refusal(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """REGEL 2/3 guard: refusal reason when this card may not start yet.
+
+    Returns ``None`` when the card is authorized to start: no ``start`` flag in
+    its created-event lineage, the flag is True, an explicit ``start_approved``
+    event exists on the card itself or on its start origin, the card already
+    ran once, or the card is not part of a decomposition tree (its only exits
+    from triage are explicit human actions).
+    """
+    if _has_been_started(conn, task_id) or not _has_decompose_lineage(conn, task_id):
+        return None
+    origin_id = _start_flag_task_id(conn, task_id)
+    if origin_id is None:
+        return None
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+        "ORDER BY created_at DESC, id DESC LIMIT 1", (origin_id,),
+    ).fetchone()
+    if not row or _json_dict(_row_get(row, "payload")).get("start") is not False:
+        return None
+    for candidate in (task_id, origin_id if origin_id is not None else task_id):
+        approved = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+            (candidate, START_APPROVAL_EVENT),
+        ).fetchone()
+        if approved:
+            return None
+    return (
+        "start=False, awaiting approval "
+        f"(approve with `hermes kanban approve {task_id}`)"
+    )
+
+
+def start_approval_exists(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether an explicit ``start_approved`` event exists on this card or on
+    its start origin. Shared by the promote/claim gate and the dispatcher's
+    ``_card_startable`` so an approval releases a card end-to-end."""
+    candidates = [task_id]
+    origin_id = _start_flag_task_id(conn, task_id)
+    if origin_id is not None and origin_id != task_id:
+        candidates.append(origin_id)
+    for candidate in candidates:
+        if conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+            (candidate, START_APPROVAL_EVENT),
+        ).fetchone():
+            return True
+    return False
+
+
+def approve_task_start(
+    conn: sqlite3.Connection, task_id: str, *, actor: Optional[str] = None,
+    note: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Record an explicit human/Smeden start approval on a card.
+
+    Approving the start origin releases the whole decomposed tree (children
+    check their origin); approving a single card releases only that card.
+    """
+    if _task_status(conn, task_id) is None:
+        return False, f"task {task_id} not found"
+    payload: dict[str, Any] = {"actor": actor}
+    if note:
+        payload["note"] = note
+    with write_txn(conn):
+        _append_event(conn, task_id, START_APPROVAL_EVENT, payload)
+    return True, None
+
+
 def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
     dry_run: bool = False,
@@ -3491,6 +3741,12 @@ def promote_task(
             f"'todo' or 'blocked'"
         )
 
+    # REGEL 2/3 start gate (t_ab7f2b5d): a start=False card is never promoted
+    # without explicit approval, whichever writer drives the promotion.
+    start_refusal = start_start_refusal(conn, task_id)
+    if start_refusal:
+        return False, f"skip promote: {start_refusal}"
+
     # No override: claim_task demotes ready -> todo on an undone parent whichever
     # writer set 'ready', so a forced promotion would only report a success the
     # first claim silently reverts (#106195). The dependency itself is the knob.
@@ -3507,6 +3763,15 @@ def promote_task(
             f"bypass them; complete the parents or drop the link with "
             f"`hermes kanban unlink <parent_id> {task_id}`)"
         )
+
+    # Fail-closed ready owner gate (t_f7992f0f): promotion must not park a
+    # card in 'ready' without a spawnable (or human-lane) owner.
+    owner_row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    refusal = ready_owner_refusal(owner_row["assignee"] if owner_row else None)
+    if refusal:
+        return False, f"cannot promote {task_id} to ready: {refusal}"
 
     if dry_run:
         return True, None
@@ -3574,6 +3839,18 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
+        # Fail-closed ready owner gate (t_f7992f0f): never land an ownerless
+        # card in 'ready'; park it in 'todo' with a visible refusal instead.
+        if new_status == "ready":
+            owner_row = conn.execute(
+                "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            refusal = ready_owner_refusal(owner_row["assignee"] if owner_row else None)
+            if refusal:
+                new_status = "todo"
+                _append_event(
+                    conn, task_id, "ready_owner_refused", {"reason": refusal},
+                )
         # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
         # resetting them is the amnesia that let cron-unblock <-> re-block loop
         # unbounded; only complete_task clears them. ``consecutive_failures``
@@ -3609,6 +3886,15 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             note="invariant recovery on review reopen",
         )
         new_status = _landing_status_after_parents(conn, task_id)
+        # Fail-closed ready owner gate (t_f7992f0f): a review reopen without a
+        # spawnable (or human-lane) owner lands in 'todo' instead.
+        if new_status == "ready":
+            owner_row = conn.execute(
+                "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            refusal = ready_owner_refusal(owner_row["assignee"] if owner_row else None)
+            if refusal:
+                new_status = "todo"
         review_event = _latest_event(conn, task_id, "review_requested")
         handoff = _json_dict(_row_get(review_event, "payload"))
         implementer = _nonblank_str(handoff.get("implementer"))
@@ -3790,7 +4076,7 @@ def specify_triage_task(
     return True
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
+def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, author: Optional[str] = None) -> bool:
     """Archive a task; a *running* task's host-local worker is terminated.
 
     Clearing ``worker_pid`` in the DB alone left the OS process running past its
@@ -3834,6 +4120,69 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     recompute_ready(conn)
     # Reap the workspace on archive too (never-completed tasks kept it forever).
     _cleanup_workspace(conn, task_id)
+    _receipt_comment(conn, task_id, "Arkiveret", author)
+    return True
+
+
+def unarchive_task(conn: sqlite3.Connection, task_id: str, *, author: Optional[str] = None) -> bool:
+    """Restore an archived task to active status (ready/todo based on parents).
+
+    Reverses the archive operation: sets status back to 'ready' if all parents
+    are terminal (done/archived), otherwise 'todo'. Preserves all task data,
+    comments, events, links, and attachments. The task becomes dispatchable again.
+
+    Because ``archived`` counts as terminal for dependency gating, a child may
+    have been promoted to ``ready``/``review`` while this task was archived.
+    Reopening the task makes it non-terminal again, so any *unclaimed* child
+    whose parents are no longer satisfied is returned to the ``todo`` gate
+    (mirroring :func:`claim_task` / :func:`claim_review_task`, which would
+    otherwise reject and demote it on the next tick). Running children are
+    left untouched.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] != "archived":
+            return False  # Only archived tasks can be unarchived
+
+        # Determine target status based on parent satisfaction (same logic as create_task)
+        target_status = "ready" if _parents_satisfied(conn, task_id) else "todo"
+
+        cur = conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ? AND status = 'archived'",
+            (target_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+
+        _append_event(conn, task_id, "unarchived", {"status": target_status})
+
+        # Re-gate children this reopen un-satisfied: a child promoted while the
+        # parent was archived returns to 'todo' if it is still unclaimed.
+        child_rows = conn.execute(
+            "SELECT t.id, t.status FROM tasks t "
+            "JOIN task_links l ON l.child_id = t.id "
+            "WHERE l.parent_id = ? AND t.status IN ('ready', 'review') "
+            "AND t.claim_lock IS NULL",
+            (task_id,),
+        ).fetchall()
+        for child in child_rows:
+            if not _parents_satisfied(conn, child["id"]):
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = ?",
+                    (child["id"], child["status"]),
+                )
+                _append_event(
+                    conn, child["id"], "dependency_wait",
+                    {"reason": "parent_reopened", "source_status": child["status"]},
+                )
+
+    # Unarchived parent may now block children; re-evaluate promotion.
+    recompute_ready(conn)
+    _receipt_comment(conn, task_id, "Genåbnet fra arkiv", author)
     return True
 
 
@@ -4102,6 +4451,74 @@ def list_profiles_on_disk() -> list[str]:
     return sorted(names)
 
 
+def _ready_gate_managed() -> bool:
+    """True when a managed ``profiles/`` dir exists — i.e. profile discovery
+    is meaningful and the ready owner gate binds (t_f7992f0f)."""
+    from hermes_constants import get_default_hermes_root
+
+    try:
+        return (get_default_hermes_root() / "profiles").is_dir()
+    except Exception:
+        return False
+
+
+def ready_owner_refusal(assignee: Optional[str]) -> Optional[str]:
+    """Fail-closed gate for any transition INTO ``ready`` (t_f7992f0f).
+
+    ``ready`` means "the dispatcher may spawn this now": a card parked there
+    with an empty assignee (NULL class) or a non-profile assignee (phantom
+    ``flow`` class) never dispatches and silently rots. Returns ``None`` when
+    the owner is valid, else a refusal message naming the profiles that ARE
+    on disk so feeders can self-correct.
+
+    Enforcement scope: the gate binds only where profile discovery is
+    meaningful — a ``profiles/`` directory the operator manages. Where the
+    dir does not exist (fresh single-profile installs, hermetic test homes)
+    the concept of "not a real profile" is undefined and the caller is
+    trusted (the dispatcher's ``skipped_nonspawnable`` stays the backstop).
+
+    ``default`` is always live (parity with ``profiles.profile_exists``);
+    ``HUMAN_READY_LANES`` are exempt: they are legitimate owners pulled by
+    other gateways (the human ``jacob``), not spawnable profiles.
+    """
+    who = (assignee or "").strip()
+    if not _ready_gate_managed():
+        return None
+    if who == "default" or who in HUMAN_READY_LANES:
+        return None
+    valid = list_profiles_on_disk()
+    if not who:
+        return (
+            "ready requires an owner: pass --assignee <profile> (a ready card "
+            "without one would never dispatch). Valid profiles: "
+            + (", ".join(valid) or "(none on disk)")
+            + "; the human lane 'jacob' is also a valid owner"
+        )
+    if who not in valid:
+        return (
+            f"assignee '{who}' is not a spawnable profile. Valid profiles: "
+            + (", ".join(valid) or "(none on disk)")
+            + "; the human lane 'jacob' is also a valid owner"
+        )
+    return None
+
+
+# Seam: tests/conftest.py may neutralize this gate (module-attr patch) the way
+# the dispatcher's memory guard is pinned; board code must call the module attr.
+ready_owner_refusal_impl = ready_owner_refusal
+
+
+def _default_assignee_from_config() -> Optional[str]:
+    """``kanban.default_assignee`` from the active config, or None (#27145)."""
+    try:
+        from hermes_cli.config import load_config
+
+        value = (load_config().get("kanban") or {}).get("default_assignee")
+        return str(value).strip() or None
+    except Exception:
+        return None
+
+
 def known_assignees(conn: sqlite3.Connection) -> list[dict]:
     """``{"name", "on_disk", "counts"}`` for every on-disk profile or task
     assignee, so a fresh profile appears in pickers before it has a task."""
@@ -4202,6 +4619,16 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
     ).fetchall()
     return {r["task_id"]: r["started_at"] for r in rows}
 
+
+# --- Worker-context renderers (split out; imports this module as ``_kb``) ---
+from hermes_cli.kanban_db_context import (  # noqa: E402
+    _ctx_attachments,
+    _ctx_comments,
+    _ctx_header,
+    _ctx_parent_results,
+    _ctx_prior_attempts,
+    _ctx_role_history,
+)
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
 # --- Worker-context renderers (split out; imports this module as ``_kb``) ---

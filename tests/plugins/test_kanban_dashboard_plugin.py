@@ -435,20 +435,27 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
 # ---------------------------------------------------------------------------
 
 def test_delete_task(client):
+    """DELETE = reversible archive (soft delete): the card survives, is
+    retrievable, and can be un-archived — never a silent hard delete."""
     t = client.post("/api/plugins/kanban/tasks", json={"title": "to-delete"}).json()["task"]
     r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
     assert r.status_code == 200
-    assert r.json()["deleted"] is True
+    assert r.json()["archived"] is True
     assert r.json()["task_id"] == t["id"]
 
-    # Gone from board
+    # Hidden from the default board...
     board = client.get("/api/plugins/kanban/board").json()
     all_ids = [tt["id"] for col in board["columns"] for tt in col["tasks"]]
     assert t["id"] not in all_ids
 
-    # Gone from detail
+    # ...but still there, archived, and reversible.
     r = client.get(f"/api/plugins/kanban/tasks/{t['id']}")
-    assert r.status_code == 404
+    assert r.status_code == 200, "removal must archive, not hard-delete"
+    assert r.json()["task"]["status"] == "archived"
+
+    back = client.patch(f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "unarchived"})
+    assert back.status_code == 200, back.text
+    assert client.get(f"/api/plugins/kanban/tasks/{t['id']}").json()["task"]["status"] == "ready"
 
 # ---------------------------------------------------------------------------
 # Comments + Links
@@ -715,6 +722,26 @@ def test_dashboard_confirm_dispatches_expected_patch_body(client):
     body = r.json()["task"]
     assert body["status"] == "done"
     assert body.get("result") == "shipped"
+
+def test_patch_archive_hides_task_then_filter_reveals_it(client):
+    """The card's "Arkiver" action fires PATCH {status: "archived"} (via the
+    board's moveTask). That must archive the task, hide it from the default
+    board, and reveal it again under the archived filter toggle — the
+    optimistic-refresh contract the UI relies on."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    r = client.patch(f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "archived"})
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["status"] == "archived"
+
+    board = client.get("/api/plugins/kanban/board").json()
+    ids = {c["id"] for col in board["columns"] for c in col["tasks"]}
+    assert t["id"] not in ids, "archived task must be hidden from the default board"
+
+    board2 = client.get("/api/plugins/kanban/board?include_archived=true").json()
+    archived = next((col for col in board2["columns"] if col["name"] == "archived"), None)
+    assert archived is not None, "include_archived must add the archived column"
+    assert t["id"] in {c["id"] for c in archived["tasks"]}
+
 
 def test_bulk_archive(client):
     a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
@@ -1120,6 +1147,53 @@ def test_touch_card_tap_opens_instead_of_dragging():
         pytest.skip("node not available")
     bundle = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
     probe = Path(__file__).parent / "fixtures" / "kanban_touch_drag_probe.js"
+    result = subprocess.run(
+        [node, str(probe), str(bundle)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "PASS" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Card archive action from the UI ('Handlinger' / ⋯ menu)
+# ---------------------------------------------------------------------------
+
+def test_card_archive_action_requests_archived_move():
+    """The task card must expose an "Arkiver" action in its ⋯ actions menu and,
+    when clicked, request a move to status "archived" via props.onMove — the same
+    path a drag-to-archive uses (PATCH status=archived → optimistic list refresh).
+    An already-archived card must not expose the trigger. The bundle has no build
+    step, so this extracts `TaskCard` verbatim and drives the real click handlers
+    with a minimal React/SDK stub — behavioral, not a source-text pin.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    bundle = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    probe = Path(__file__).parent / "fixtures" / "kanban_card_archive_probe.js"
+    result = subprocess.run(
+        [node, str(probe), str(bundle)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "PASS" in result.stdout
+
+
+def test_card_archive_confirm_warns_when_killing_running_worker():
+    """Archiving a card is a terminal status: it releases the claim and kills a
+    worker that is mid-run. The destructive-confirm description must therefore
+    carry the "Dette dræber den kørende worker." warning when the card's source
+    status is running, and must NOT when it is not. The bundle has no build
+    step, so the probe extracts the real getDestructiveConfirm (and the
+    FALLBACK_* constants it closes over) verbatim and drives it — behavioral,
+    not a source-text pin.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    bundle = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    probe = Path(__file__).parent / "fixtures" / "kanban_card_archive_running_warning_probe.js"
     result = subprocess.run(
         [node, str(probe), str(bundle)],
         capture_output=True, text=True, timeout=30,

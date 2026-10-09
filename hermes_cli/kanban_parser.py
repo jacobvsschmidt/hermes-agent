@@ -176,8 +176,18 @@ _SPECS = [
                   "deterministic branch. See `hermes project list`."),
         _TENANT,
         _PRIORITY,
+        _arg("--start", action="store_true",
+             help="Explicitly authorize starting a worker on this card as soon as it is "
+                  "created (Regel 2/3). Without --start or a resolvable --plan, a created "
+                  "card is parked in triage and NEVER auto-starts."),
+        _arg("--plan", action="store_true",
+             help="Authorize starting this card because it is part of today's plan "
+                  "(<plan_root>/<YYYY-MM-DD>-PLAN.md). The title must be listed in the "
+                  "plan; if it is not (or the plan cannot be resolved), the card is "
+                  "REFUSED a start and parked in triage (fail-closed)."),
         _arg("--triage", action="store_true",
-             help="Park in triage — a specifier will flesh out the spec and promote to todo"),
+             help="Explicitly park in triage — a specifier will flesh out the spec and "
+                  "promote to todo. Mutually exclusive with --start/--plan."),
         _arg("--idempotency-key",
              help="Dedup key. If a non-archived task with this key exists, "
                   "its id is returned instead of creating a duplicate."),
@@ -214,9 +224,10 @@ _SPECS = [
         _arg("--goal-max-turns", type=int, metavar="N", dest="goal_max_turns",
              help="Turn budget for --goal workers (default 20). Ignored without --goal."),
         _arg("--initial-status", choices=sorted(kb.VALID_INITIAL_STATUSES), default="running",
-             help="Initial card status. Use 'blocked' for cards "
-                  "that require immediate human ops (R3 gate) "
-                  "to skip the brief running-to-blocked transition."),
+             help="When a start IS authorized (--start/--plan), select the initial card "
+                  "status: 'running' -> ready (dispatcher picks it up), 'blocked' parks it "
+                  "for immediate human ops (R3 gate). This flag does NOT by itself "
+                  "authorize a start — without --start/--plan the card parks in triage."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     _cmd("swarm", [
@@ -354,11 +365,20 @@ _SPECS = [
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
     ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
+    _cmd("approve", [
+        _TASK_ID,
+        _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),
+        _bulk_ids("approve"),
+    ], help="Explicitly approve start for a parked start=False card (REGEL 2/3) "
+            "— releases the card (and, on the decompose root, its whole tree)"),
     _cmd("archive", [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
         _arg("--rm", dest="purge_ids", nargs="+",
              help="Permanently delete already-archived task ids from the board"),
     ], help="Archive one or more tasks"),
+    _cmd("unarchive", [
+        _arg("task_ids", nargs="+", help="Archived task ids to restore to active status"),
+    ], help="Restore one or more archived tasks to active status (ready/todo)"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
     _cmd("dispatch", [
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),

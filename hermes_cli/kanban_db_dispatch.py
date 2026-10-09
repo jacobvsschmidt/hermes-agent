@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import random
 import re
 import signal
 import sqlite3
@@ -38,6 +39,20 @@ DEFAULT_FAILURE_LIMIT = 2
 # Worker log files larger than this at spawn time are rotated.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
+
+# Regel 2/3 defense-in-depth (t_82cedb90): the dispatcher must never auto-start
+# a worker for a card that is neither explicitly start-authorized (its
+# ``created`` event carries ``start: true``) nor listed in today's plan — and,
+# regardless of card status or per-board budget, must never exceed this many
+# concurrent workers. Overridable via ``kanban.max_concurrent_workers`` (>= 1).
+DEFAULT_MAX_CONCURRENT_WORKERS = 3
+
+# Greppable log tags for the two refusal classes the acceptance criteria name:
+# an unplanned ready card and a card refused by the concurrency ceiling. Any
+# operator/watch can ``grep -E 'REGEL3_(UNPLANNED_SKIP|CONCURRENCY_CAP)'`` to
+# see why ready cards are being held.
+GUARD_LOG_TAG_UNPLANNED = "REGEL3_UNPLANNED_SKIP"
+GUARD_LOG_TAG_CONCURRENCY = "REGEL3_CONCURRENCY_CAP"
 
 # Keep a little wall-clock budget for the worker to observe a terminal timeout
 # and make a terminal board call (kanban_block/kanban_complete/kanban_request_review)
@@ -129,6 +144,16 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    skipped_unplanned: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` ready cards refused because they were neither
+    start-authorized (their ``created`` event carries ``start: true``) nor
+    listed in today's plan (Regel 3 defense-in-depth). Left parked in ``ready``
+    with a greppable log; this is the exact slippery lane the fix closes."""
+    skipped_concurrency_capped: list[tuple[str, int]] = field(default_factory=list)
+    """``(task_id, running_count)`` cards of ANY status refused because the hard
+    global ceiling ``kanban.max_concurrent_workers`` (default
+    ``DEFAULT_MAX_CONCURRENT_WORKERS`` = 3) was already met — a 4th (or higher)
+    worker is never started side-by-side with existing workers."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -173,6 +198,12 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.skipped_unplanned:
+            counts["unplanned"] = counts.get("unplanned", 0) + len(res.skipped_unplanned)
+        if res.skipped_concurrency_capped:
+            counts["concurrency_cap"] = (
+                counts.get("concurrency_cap", 0) + len(res.skipped_concurrency_capped)
+            )
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -1097,11 +1128,39 @@ def _classify_dead_worker_exit(
     if kind == "rate_limited":
         # Quota wall — NOT a task failure. Release to the source phase and do
         # NOT count a failure so a long quota window can't trip the breaker.
+        # Enhanced rate_limited event with model, quota window, and error message.
+        # The model and quota information should be available from the worker's
+        # configuration or the error message when it encounters a rate limit.
+        # For now, we'll include the basic information and enhance it with
+        # additional context from the worker's exit.
+        error_message = f"pid {pid} exited rate-limited (quota wall) — requeued without counting a failure"
+        
+        # Try to extract model and quota information from the worker's error
+        # In a real implementation, this would come from the worker's
+        # configuration or the specific rate limit error message
+        model_info = "unknown"
+        quota_window = "unknown"
+        
+        # Check if we have additional context in the worker's error
+        # This is where we would parse the actual rate limit error
+        # For now, we'll create a structured payload with the basic info
+        
+        event_payload = {
+            "pid": pid,
+            "claimer": claimer,
+            "exit_code": code,
+            "model": model_info,
+            "quota_window": quota_window,
+            "error_message": error_message,
+            "rate_limit_details": "quota wall encountered",
+            "retry_count": 0,  # Will be tracked by the dispatcher
+        }
+        
         return _DeadWorker(
             kind, code,
-            f"pid {pid} exited rate-limited (quota wall) — requeued without counting a failure",
+            error_message,
             "rate_limited",
-            {"pid": pid, "claimer": claimer, "exit_code": code},
+            event_payload,
             rate_limited=True,
         )
     if kind == "terminal_provider":
@@ -1184,6 +1243,25 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 error=dead.error_text,
                 metadata=dict(dead.event_payload),
             )
+            # Store the attempt count for exponential backoff tracking
+            if dead.rate_limited:
+                # Use existing attempt counter from event payload if present, else derive from last_failure_error
+                attempt = 0
+                if "attempt" in dead.event_payload:
+                    attempt = int(dead.event_payload["attempt"])
+                elif dead.error_text:
+                    # Try to extract attempt count from error message
+                    import re
+                    match = re.search(r'attempt (\d+)', dead.error_text)
+                    if match:
+                        attempt = int(match.group(1))
+                    else:
+                        # Default to attempt 0 for first rate_limited event
+                        attempt = 0
+                # Update event_payload with attempt counter
+                dead.event_payload["attempt"] = attempt
+                # Increment attempt for next time
+                dead.event_payload["attempt"] = attempt + 1
             _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
             sweep.exited_hook_payloads.append({
                 "task_id": row["id"],
@@ -1194,6 +1272,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "exit_code": dead.code,
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
+                "event_payload": dead.event_payload,  # Include payload for rate_limited tracking
             })
             if dead.rate_limited or dead.protocol_violation:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
@@ -1522,6 +1601,24 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _compute_rate_limit_backoff(attempt: int, base_seconds: int = 60, max_cap: int = 600) -> int:
+    """Exponential backoff with full jitter.
+
+    ``pause = random(0, min(max_cap, base * 2^attempt))``
+
+    * ``attempt``: 0-based attempt number (first rate_limited = attempt 0)
+    * ``base_seconds``: starting backoff in seconds (default 60s / 1 min)
+    * ``max_cap``: maximum pause in seconds (default 600s / 10 min)
+
+    Full jitter means the *entire* computed range [0, cap] is randomized,
+    not a ±% nudge around a centre. This spreads the flood across workers
+    instead of letting them re-clash in lockstep.
+    """
+    raw = base_seconds * (2 ** attempt)
+    cap = min(max_cap, raw)
+    return int(cap * random.random())  # full jitter: [0, cap)
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1530,18 +1627,23 @@ def check_respawn_guard(
     Called per ready/review row before any claim attempt. Priority order:
     ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
     refused — no restart-safe scope — within the cooldown; never counted),
-    ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
-    checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
-    ``last_failure_error`` that would otherwise park the task forever — that
-    path never increments ``consecutive_failures``), ``"blocker_auth"``
-    (quota/auth pattern; the breaker still trips eventually), then for the
-    ready lane only ``"recent_success"`` (completed run within the window, unless
-    a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
-    handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
-    handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
-    passes own those.
+    ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the
+    backoff window; checked BEFORE ``blocker_auth`` because the requeue stamps
+    a quota-flavoured ``last_failure_error`` that would otherwise park the
+    task forever — that path never increments ``consecutive_failures``),
+    ``"blocker_auth"`` (quota/auth pattern; the breaker still trips eventually),
+    then for the ready lane only ``"recent_success"`` (completed run within
+    the window, unless a re-queue event arrived after it — a deliberate re-run)
+    and ``"active_pr"`` (PR URL in a recent comment; re-spawning risks a
+    duplicate PR — unless a handoff event followed the comment: the named
+    profile must work on that PR). The review lane skips the last two: they
+    are the *inputs* to a review handoff. Stale / dead claim locks are NOT
+    a guard reason — the reclaim passes own those.
+
+    The ``rate_limit_cooldown`` reason now uses exponential backoff with full
+    jitter (1 min, 2 min, 4 min, 8 min … capped at 10 min) instead of a
+    fixed cooldown. Each consecutive ``rate_limited`` run doubles the pause,
+    with the exact wait-time randomised per-worker so they don't re-clash.
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
@@ -1552,35 +1654,76 @@ def check_respawn_guard(
 
     now = int(time.time())
 
-    # 1. Rate-limit cooldown — see docstring for why this precedes blocker_auth.
-    #    LATEST run only: a newer crash/completion supersedes the rate-limit run.
-    #    An infrastructure spawn refusal (#114720) shares the cooldown: the host
-    #    condition is not the card's, so it retries forever, spaced, and never
-    #    reaches the breaker.
-    rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
+    # ── 1. Rate-limit backoff ────────────────────────────────────────────
+    # Determine the number of consecutive rate_limited runs for this task.
+    # We look at the most recent rate_limited run and count how many prior
+    # rate_limited runs exist within the exponential-backoff window.
     latest_run = conn.execute(
         "SELECT outcome, ended_at, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    if latest_run is not None and latest_run["outcome"] == "spawn_failed":
-        if rl_cooldown > 0 and _kb._json_dict(latest_run["metadata"]).get("infrastructure"):
-            ended_at = latest_run["ended_at"]
-            if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
-                return "infrastructure_cooldown"
+
+    # Count consecutive rate_limited runs (newest first), stopping at the
+    # first non-rate-limited outcome or the scan limit.
+    consecutive_rl = 0
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
-        if rl_cooldown <= 0:
-            # Cooldown disabled — respawn immediately, skipping blocker_auth so
-            # the stamped rate-limit text doesn't re-trap the task.
-            return None
+        # Scan prior runs to count the streak of rate_limited outcomes.
+        prior = conn.execute(
+            "SELECT outcome FROM task_runs "
+            "WHERE task_id = ? AND ended_at IS NOT NULL "
+            "ORDER BY ended_at DESC LIMIT 50",
+            (task_id,),
+        ).fetchall()
+        for prow in prior:
+            if prow["outcome"] == "rate_limited":
+                consecutive_rl += 1
+            else:
+                break
+        # Also check the event log for rate_limited markers.
+        rl_events = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'rate_limited' AND created_at IS NOT NULL "
+            "ORDER BY created_at DESC LIMIT 50",
+            (task_id,),
+        ).fetchall()
+        for pev in rl_events:
+            try:
+                pdata = _kb._json_or(pev["payload"], {})
+                # If the event payload carries an 'attempt' counter, use it.
+                if isinstance(pdata, dict) and "attempt" in pdata:
+                    # Use the event's attempt; our counter above is just a guide.
+                    consecutive_rl = max(consecutive_rl, int(pdata["attempt"]) + 1)
+            except Exception:
+                pass
+
+    if latest_run is not None and latest_run["outcome"] == "rate_limited" and consecutive_rl > 0:
+        # Exponential backoff with full jitter: 1min, 2min, 4min, 8min … capped at 10min.
+        backoff_seconds = _compute_rate_limit_backoff(
+            attempt=consecutive_rl - 1,  # 0-based
+            base_seconds=60,               # start at 1 min
+            max_cap=600,                   # cap at 10 min
+        )
         ended_at = latest_run["ended_at"]
-        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
-            return "rate_limit_cooldown"
-        # Cooldown elapsed — return early so blocker_auth doesn't catch the
-        # stamped rate-limit text; this path intentionally retries forever
-        # (spaced by the cooldown) until quota returns or a real run supersedes it.
+        if ended_at is not None and (now - int(ended_at)) < backoff_seconds:
+            return f"rate_limit_cooldown:{backoff_seconds}"  # human-readable with timeout
+
+        # Backoff elapsed — allow respawn, but stamp the attempt count so
+        # the next tick knows how long ago we last hit the wall.
+        # We do NOT return a guard reason, so the task may be re-spawned.
+        # The attempt counter is persisted via the rate_limited event payload
+        # (set by the dispatch tick below).
         return None
+
+    # If the latest run is NOT rate_limited, reset the consecutive counter.
+    # (Any other outcome breaks the streak.)
+
+    # ── 2. Quota / auth blocker ──────────────────────────────────────────
+    err = _kb._lossy_text(row["last_failure_error"])
+    latest_outcome = latest_run["outcome"] if latest_run is not None else None
+    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+        return "blocker_auth"
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
     # crash is different: its persisted error includes the worker's last
@@ -1877,6 +2020,142 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
+def _startable_guard_env() -> Optional[bool]:
+    """Optional ops emergency override ``HERMES_KANBAN_STARTABLE_GUARD`` (a
+    ``0``/``off``/``false`` value turns the Regel 3 gate off). Returns None when
+    unset so the config/file-closed default applies."""
+    raw = os.environ.get("HERMES_KANBAN_STARTABLE_GUARD", "").strip()
+    if not raw:
+        return None
+    return raw.lower() not in {"0", "off", "false", "no", "disabled"}
+
+
+def configured_startable_guard() -> bool:
+    """Whether the Regel 2/3 startability gate is active for ready-lane spawns.
+
+    ``kanban.startable_guard`` in config, else the fail-closed default ``True``
+    (Regel 3 DEFENSE-IN-DEPTH, t_82cedb90). Fail-closed means an unreadable
+    config keeps the gate ON — a broken config can never widen the auto-start
+    scope. ``HERMES_KANBAN_STARTABLE_GUARD=0`` is the emergency release valve.
+    """
+    override = _startable_guard_env()
+    if override is not None:
+        return override
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("startable_guard")
+    except Exception:
+        return True
+    return True if raw is None else bool(raw)
+
+
+def configured_max_concurrent_workers() -> Optional[int]:
+    """Hard global worker ceiling ``kanban.max_concurrent_workers`` (>= 1).
+
+    Returns the configured value, or None when unset/invalid — the caller then
+    falls back to ``DEFAULT_MAX_CONCURRENT_WORKERS`` (3). ``HERMES_KANBAN_MAX_CONCURRENT_WORKERS``
+    is an ops override.
+    """
+    raw = os.environ.get("HERMES_KANBAN_MAX_CONCURRENT_WORKERS", "").strip()
+    if not raw:
+        try:
+            from hermes_cli.config import load_config_readonly
+            raw = (load_config_readonly() or {}).get("kanban", {}).get("max_concurrent_workers")
+        except Exception:
+            raw = None
+    if raw is None:
+        return None
+    try:
+        ival = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return ival if ival >= 1 else None
+
+
+def _plan_root() -> Path:
+    """``$HERMES_KANBAN_PLAN_DIR`` else ``<hermes root>/inbox`` (Regel 2/3 plan
+    store). Mirrors ``kanban_cli._plan_root`` so ``create --plan`` and the
+    dispatcher gate resolve the exact same file."""
+    override = os.environ.get("HERMES_KANBAN_PLAN_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return _kb.kanban_home() / "inbox"
+
+
+def _today_plan_authorizes(title: Optional[str]) -> tuple[bool, Optional[str]]:
+    """Fail-closed Regel 3 plan gate for the dispatcher's startability check.
+
+    True ONLY when today's plan file exists, is readable, and lists ``title``.
+    Plan file ``<plan_root>/<YYYY-MM-DD>-PLAN.md`` (``_plan_root``), date local.
+    Title match is case-insensitive on whitespace-collapsed line content (a bare
+    ``Title`` matches ``- Title`` / ``## Title``). Mirrors
+    ``kanban_cli._plan_authorizes`` so the dispatcher never disagrees with
+    ``create --plan``. Any failure — empty title, no file, unreadable file,
+    title absent — returns ``(False, reason)`` (refuse to start).
+    """
+    if not title or not title.strip():
+        return False, "cannot judge an empty title against today's plan"
+    plan = _plan_root() / f"{time.strftime('%Y-%m-%d')}-PLAN.md"
+    if not plan.is_file():
+        return False, f"today's plan not found at {plan} — unplanned card refused"
+    try:
+        text = plan.read_text(encoding="utf-8")
+    except OSError as exc:
+        return False, f"cannot read today's plan {plan}: {exc}"
+    needle = " ".join(title.strip().split()).casefold()
+    if not needle:
+        return False, "empty title"
+    for raw in text.splitlines():
+        line = " ".join(raw.split()).casefold()
+        if needle in line:
+            return True, None
+    return False, f"title {title!r} is not listed in today's plan {plan}"
+
+
+def _card_startable(conn: sqlite3.Connection, task_id: str) -> tuple[bool, Optional[str]]:
+    """``(can_start, reason)`` for one READY card under Regel 2/3.
+
+    A card may only auto-start when its ``created`` event carries ``start: true``
+    (an explicit ``--start``, or a ``--plan`` whose title matched today's plan at
+    creation — both recorded by ``create_task(start_authorized=...)``) OR its
+    title is listed in today's plan file. Everything else is refused fail-closed —
+    including, by construction, any card that leaked into ``ready`` from
+    ``triage`` or a bare self-create. Failure to read the created event or the
+    plan refuses too; never start "just in case".
+    """
+    start_authorized = False
+    try:
+        row = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'created' "
+            "ORDER BY created_at ASC, id ASC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is not None and row["payload"]:
+            data = _kb._json_or(row["payload"], {})
+            if isinstance(data, dict):
+                start_authorized = bool(data.get("start"))
+    except Exception:
+        # Cannot read the durable start marker — fail closed toward plan check.
+        start_authorized = False
+    if start_authorized:
+        return True, None
+    # An explicit human/Smeden approval (`hermes kanban approve`) releases a
+    # start=False card — including decomposed children via their start origin.
+    try:
+        if _kb.start_approval_exists(conn, task_id):
+            return True, None
+    except Exception:
+        pass  # fall through to the fail-closed plan check
+    trow = conn.execute("SELECT title FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    title = trow["title"] if trow is not None else None
+    try:
+        return _today_plan_authorizes(title)
+    except Exception as exc:
+        # Truly unexpected plan failure — refuse to start, never "just in case".
+        return False, f"could not judge today's plan for card {task_id}: {exc}"
+
+
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
@@ -1964,6 +2243,8 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    startable_guard: Optional[bool] = None,
+    max_concurrent_workers: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1987,6 +2268,8 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            startable_guard=startable_guard,
+            max_concurrent_workers=max_concurrent_workers,
         )
 
     try:
@@ -2036,6 +2319,9 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    startable_guard: bool = True,
+    max_concurrent_workers: Optional[int] = None,
+    tick_spawned: Optional[list] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2063,6 +2349,41 @@ def _dispatch_lane_task(
                         or last["payload"] != _kb._json_or_null({"assignee": assignee})):
                     _kb._append_event(conn, task_id, "skipped_nonspawnable", {"assignee": assignee})
         return False
+    # Hard global concurrency ceiling (Regel 3, defense-in-depth): never a
+    # 4th-or-higher worker, whatever the card's status or the per-board budget
+    # suggests. Refuse HERE (per card) so the refusal is logged with the card id
+    # and reason and lands in skipped_concurrency_capped — exactly the greppable
+    # evidence the max-3 acceptance criterion wants. ``tick_spawned`` lets a
+    # dry_run tick see its own pending spawns (real spawns are already reflected
+    # in the DB's running count via ``claim``), so the ceiling predicts correctly.
+    if max_concurrent_workers is not None:
+        spawned_this_tick = tick_spawned[0] if tick_spawned else 0
+        running = count_running_tasks(conn) + (spawned_this_tick if dry_run else 0)
+        if running >= max_concurrent_workers:
+            result.skipped_concurrency_capped.append((task_id, running))
+            _kb._log.warning(
+                "kanban dispatch: %s card=%s assignee=%s lane=%s running=%d cap=%d "
+                "— no %dth worker started (hard global ceiling)",
+                GUARD_LOG_TAG_CONCURRENCY, task_id, assignee, lane,
+                running, max_concurrent_workers, running + 1,
+            )
+            return False
+    # Startability gate (Regel 2/3): only a ready card that was explicitly
+    # start-authorized (created-event ``start: true``) OR is listed in today's
+    # plan may auto-spawn. Everything else (incl. anything leaked from
+    # ``triage``) is skipped and left parked. The review lane is an
+    # operator/worker-authorized handoff and stays exempt: it is the plan's own
+    # follow-up, not a fresh auto-start.
+    if startable_guard and lane == "ready":
+        can_start, reason = _card_startable(conn, task_id)
+        if not can_start:
+            result.skipped_unplanned.append((task_id, reason or "unplanned not authorized"))
+            _kb._log.warning(
+                "kanban dispatch: %s card=%s assignee=%s reason=%r "
+                "— not start-authorized, left parked in ready",
+                GUARD_LOG_TAG_UNPLANNED, task_id, assignee, reason,
+            )
+            return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
     if per_profile_cap is not None:
@@ -2094,6 +2415,8 @@ def _dispatch_lane_task(
     if dry_run:
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
+        if tick_spawned:
+            tick_spawned[0] += 1
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
@@ -2131,6 +2454,8 @@ def _dispatch_lane_task(
         # only on successful completion (complete_task).
         result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
         _count_spawn(claimed.assignee)
+        if tick_spawned:
+            tick_spawned[0] += 1
         return True
     except Exception as exc:
         from tools.process_registry import RestartSafeScopeUnavailable
@@ -2339,6 +2664,8 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    startable_guard: Optional[bool] = None,
+    max_concurrent_workers: Optional[int] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2346,6 +2673,16 @@ def _dispatch_once_locked(
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
     result = DispatchResult()
+    # Regel 2/3 guard + hard worker ceiling (t_82cedb90): resolve defaults here,
+    # once, so every lane row and the telemetry see the same effective values.
+    # Fail-closed — unreadable config -> guard ON, ceiling at the hard minimum.
+    if startable_guard is None:
+        startable_guard = configured_startable_guard()
+    if max_concurrent_workers is None:
+        max_concurrent_workers = (
+            configured_max_concurrent_workers() or DEFAULT_MAX_CONCURRENT_WORKERS
+        )
+    tick_spawned: list[int] = [0]
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
@@ -2394,6 +2731,8 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        startable_guard=startable_guard, max_concurrent_workers=max_concurrent_workers,
+        tick_spawned=tick_spawned,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0

@@ -35,8 +35,13 @@ def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=No
 
 
 def test_decompose_creates_children_and_promotes_root(kanban_home):
+    # start_authorized=True: this test exercises decompose mechanics, not the
+    # REGEL 2/3 start gate (see test_kanban_start_gate.py) — an unauthorized
+    # bare root stays parked in todo.
     with kbc.connect() as conn:
-        tid = _create_triage(conn, title="ship a feature")
+        tid = kb.create_task(
+            conn, title="ship a feature", triage=True, start_authorized=True,
+        )
         assert kb.get_task(conn, tid).status == "triage"
 
     children = [
