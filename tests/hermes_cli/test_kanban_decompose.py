@@ -77,8 +77,10 @@ def _patch_list_profiles(names: list[str]):
 
 
 def test_decompose_with_fanout_creates_children(kanban_home):
+    # start_authorized=True: mechanics test, not the REGEL 2/3 start gate
+    # (see test_kanban_start_gate.py — an unauthorized root parks in todo).
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="ship a feature", triage=True)
+        tid = kb.create_task(conn, title="ship a feature", triage=True, start_authorized=True)
 
     llm_payload = jsonlib.dumps({
         "fanout": True,
@@ -120,7 +122,7 @@ def test_decompose_fanout_children_inherit_root_assignee_when_unrouted(kanban_ho
     (an incognito profile with no credentials), so the old fallback spawned
     workers that deadlocked on capability blockers."""
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="ship it", assignee="zdr", triage=True)
+        tid = kb.create_task(conn, title="ship it", assignee="zdr", triage=True, start_authorized=True)
 
     llm_payload = jsonlib.dumps({
         "fanout": True,
@@ -164,7 +166,7 @@ def test_decompose_explicit_default_assignee_wins_over_root_assignee(kanban_home
     fills in when no explicit default is set (explicit config → card
     assignee → active profile)."""
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="ship it", assignee="engineer", triage=True)
+        tid = kb.create_task(conn, title="ship it", assignee="engineer", triage=True, start_authorized=True)
 
     llm_payload = jsonlib.dumps({
         "fanout": True,
@@ -266,7 +268,7 @@ def test_decompose_sequential_pipeline_chains_parents(kanban_home):
     where the migration did not exist yet.
     """
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="migrate order path to CLOB v2", triage=True)
+        tid = kb.create_task(conn, title="migrate order path to CLOB v2", triage=True, start_authorized=True)
 
     # install -> implement/signer -> post/integrate -> review -> verify
     llm_payload = jsonlib.dumps({
@@ -310,7 +312,7 @@ def test_verify_not_ready_until_implementation_done(kanban_home):
     """End-to-end gating: advance the chain one card at a time and prove the
     review/verify cards only promote AFTER their parent completes."""
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="seq pipeline", triage=True)
+        tid = kb.create_task(conn, title="seq pipeline", triage=True, start_authorized=True)
 
     llm_payload = jsonlib.dumps({
         "fanout": True,
@@ -390,7 +392,7 @@ def test_decompose_integration_card_gated_on_all_impls(kanban_home):
     integration, so nothing reconciled them.
     """
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="migrate live order path to v2", triage=True)
+        tid = kb.create_task(conn, title="migrate live order path to v2", triage=True, start_authorized=True)
 
     # Two independent impl cards (signer / client) feed ONE integration/deploy
     # card whose parents are both of them.
@@ -539,7 +541,7 @@ def test_decompose_prereq_marker_becomes_parent_edge(kanban_home):
     prerequisites become parent edges and the dependent cards stay ``todo``
     until their producers are ``done``."""
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="[SAB] new error class invalid maker amount", triage=True)
+        tid = kb.create_task(conn, title="[SAB] new error class invalid maker amount", triage=True, start_authorized=True)
 
     llm_payload = jsonlib.dumps({
         "fanout": True,
