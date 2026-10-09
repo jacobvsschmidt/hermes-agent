@@ -360,6 +360,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
+    # REGEL 2/3 (t_ab7f2b5d): record durable start intent. Bare create keeps
+    # its pre-existing routing; --start marks the card start-authorized.
+    start_authorized = bool(getattr(args, "start", False))
+    if start_authorized and bool(getattr(args, "triage", False)):
+        return _err("kanban create: --triage conflicts with --start (cannot both park and start)", 2)
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
             conn, title=args.title, body=body, assignee=args.assignee,
@@ -375,20 +380,23 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
             initial_status=getattr(args, "initial_status", "running"),
+            start_authorized=start_authorized,
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
         )
         task = kb.get_task(conn, task_id)
+    if task is None:  # create_task committed, so this is unreachable — satisfy the checker
+        return _err(f"kanban create: task {task_id} vanished after creation", 1)
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
-    else:
-        print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
-        # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
-        # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
-        if task.status == "ready" and task.assignee:
-            running, message = _check_dispatcher_presence()
-            if not running and message:
-                print(f"\n⚠  {message}", file=sys.stderr)
+        return 0
+    print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+    # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
+    # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.
+    if task.status == "ready" and task.assignee:
+        running, message = _check_dispatcher_presence()
+        if not running and message:
+            print(f"\n⚠  {message}", file=sys.stderr)
     return 0
 
 
@@ -1119,6 +1127,25 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_approve(args: argparse.Namespace) -> int:
+    """Explicit human/Smeden start approval for a start=False card (REGEL 2/3)."""
+    reason = _joined_words(args.reason) or None
+    author = _profile_author()
+    ids = list(dict.fromkeys(_bulk_ids(args)))
+    released = 0
+    failed: list[str] = []
+    with kbc.connect_closing() as conn:
+        for tid in ids:
+            ok, err = kb.approve_task_start(conn, tid, actor=author, note=reason)
+            if not ok:
+                print(f"cannot approve {tid}: {err}", file=sys.stderr)
+                failed.append(tid)
+                continue
+            released += kb.recompute_ready(conn)
+            print(f"Approved start for {tid}" + (f": {reason}" if reason else ""))
+    return 0 if not failed else 1
+
+
 def _cmd_archive(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     purge_ids = list(getattr(args, "purge_ids", None) or [])
@@ -1330,6 +1357,7 @@ _HANDLERS = {
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
+    "approve": _cmd_approve,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,

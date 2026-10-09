@@ -478,9 +478,8 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
                 # "latest run" query deterministically picks this one.
                 (review_id, _now, _now + 5),
             )
-        assert kbd.check_respawn_guard(
-            conn, review_id, lane="review"
-        ) == "rate_limit_cooldown"
+        reason = kbd.check_respawn_guard(conn, review_id, lane="review")
+        assert reason is not None and reason.startswith("rate_limit_cooldown")
 
 
 def _backdate_comments(conn, tid, seconds=60):

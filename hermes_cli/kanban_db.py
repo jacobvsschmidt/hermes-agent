@@ -29,6 +29,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli.kanban_db_start_gate import (
+    _START_REFUSAL_EVENT,
+    approve_task_start,
+    promote_task,
+    start_approval_exists,
+    start_start_refusal,
+)
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
 
@@ -1165,6 +1172,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    start_authorized: bool = False,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1302,6 +1310,9 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        # REGEL 2/3 (t_ab7f2b5d): durable start-intent marker —
+                        # the promote/claim gate reads this lineage.
+                        "start": bool(start_authorized),
                     },
                 )
                 if task_status == "blocked":
@@ -2061,6 +2072,21 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
                 continue
+            # REGEL 2/3 start gate (t_ab7f2b5d): auto-promotion never starts a
+            # card whose created lineage says start=False without approval.
+            # Decomposition stays allowed; the card stays parked until
+            # `hermes kanban approve`. One board-visible refusal event, no spam.
+            start_refusal = start_start_refusal(conn, task_id)
+            if start_refusal:
+                last = conn.execute(
+                    "SELECT kind FROM task_events WHERE task_id = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,),
+                ).fetchone()
+                if last is None or last["kind"] != _START_REFUSAL_EVENT:
+                    _append_event(
+                        conn, task_id, _START_REFUSAL_EVENT, {"reason": start_refusal},
+                    )
+                continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
@@ -2192,6 +2218,17 @@ def claim_task(
                 "WHERE id = ? AND status = 'ready'", (task_id,),
             )
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
+            return None
+        # REGEL 2/3 start gate (t_ab7f2b5d): claim is the last line of defense —
+        # a start=False card without approval never reaches running, even if a
+        # stale 'ready' status was written by an older writer.
+        start_refusal = start_start_refusal(conn, task_id)
+        if start_refusal:
+            conn.execute(
+                "UPDATE tasks SET status = 'todo' "
+                "WHERE id = ? AND status = 'ready'", (task_id,),
+            )
+            _append_event(conn, task_id, "claim_rejected", {"reason": start_refusal})
             return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
@@ -3473,54 +3510,6 @@ def request_changes(
         )
     return True, implementer
 
-
-def promote_task(
-    conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
-    dry_run: bool = False,
-) -> tuple[bool, Optional[str]]:
-    """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
-    Refused while a parent is unfinished; ``dry_run`` only validates.
-    Returns ``(ok, reason)``."""
-    cur_status = _task_status(conn, task_id)
-    if cur_status is None:
-        return False, f"task {task_id} not found"
-
-    if cur_status not in ("todo", "blocked"):
-        return False, (
-            f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
-        )
-
-    # No override: claim_task demotes ready -> todo on an undone parent whichever
-    # writer set 'ready', so a forced promotion would only report a success the
-    # first claim silently reverts (#106195). The dependency itself is the knob.
-    parents = conn.execute(
-        "SELECT t.id, t.status FROM tasks t "
-        "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ?", (task_id,),
-    ).fetchall()
-    unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
-    if unsatisfied:
-        return False, (
-            f"unsatisfied parent dependencies: {', '.join(unsatisfied)} "
-            f"(the ready -> running claim re-checks parents, so promotion cannot "
-            f"bypass them; complete the parents or drop the link with "
-            f"`hermes kanban unlink <parent_id> {task_id}`)"
-        )
-
-    if dry_run:
-        return True, None
-
-    with write_txn(conn):
-        upd = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
-        )
-        if upd.rowcount != 1:
-            return False, f"task {task_id} status changed during promotion"
-        _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
-
-    return True, None
 
 
 def _reclaim_dangling_run(

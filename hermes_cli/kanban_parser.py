@@ -177,7 +177,12 @@ _SPECS = [
         _TENANT,
         _PRIORITY,
         _arg("--triage", action="store_true",
-             help="Park in triage — a specifier will flesh out the spec and promote to todo"),
+             help="Park in triage — a specifier will flesh out the spec and promote to todo. "
+                  "Mutually exclusive with --start."),
+        _arg("--start", action="store_true",
+             help="Explicitly authorize starting a worker on this card as soon as it is "
+                  "created (Regel 2/3). A bare created card records start=False and may "
+                  "never be auto-started without explicit approval."),
         _arg("--idempotency-key",
              help="Dedup key. If a non-archived task with this key exists, "
                   "its id is returned instead of creating a duplicate."),
@@ -354,6 +359,12 @@ _SPECS = [
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
     ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
+    _cmd("approve", [
+        _TASK_ID,
+        _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),
+        _bulk_ids("approve"),
+    ], help="Explicitly approve start for a parked start=False card (REGEL 2/3) "
+            "— releases the card (and, on the decompose root, its whole tree)"),
     _cmd("archive", [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
         _arg("--rm", dest="purge_ids", nargs="+",
