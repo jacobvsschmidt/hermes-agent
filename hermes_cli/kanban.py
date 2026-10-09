@@ -1229,6 +1229,23 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_approve(args: argparse.Namespace) -> int:
+    """Explicit human/Smeden start approval for a start=False card (REGEL 2/3)."""
+    reason = _joined_words(args.reason) or None
+    author = _profile_author()
+    ids = list(dict.fromkeys(_bulk_ids(args)))
+    released = 0
+    with kbc.connect_closing() as conn:
+        for tid in ids:
+            ok, err = kb.approve_task_start(conn, tid, actor=author, note=reason)
+            if not ok:
+                print(f"cannot approve {tid}: {err}", file=sys.stderr)
+                continue
+            released += kb.recompute_ready(conn)
+            print(f"Approved start for {tid}" + (f": {reason}" if reason else ""))
+    return 0 if released >= 0 else 1
+
+
 def _cmd_archive(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     purge_ids = list(getattr(args, "purge_ids", None) or [])
@@ -1451,6 +1468,7 @@ _HANDLERS = {
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
+    "approve": _cmd_approve,
     "archive": _cmd_archive, "unarchive": _cmd_unarchive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,

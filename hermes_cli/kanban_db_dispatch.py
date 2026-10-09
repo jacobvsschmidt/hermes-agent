@@ -2140,6 +2140,13 @@ def _card_startable(conn: sqlite3.Connection, task_id: str) -> tuple[bool, Optio
         start_authorized = False
     if start_authorized:
         return True, None
+    # An explicit human/Smeden approval (`hermes kanban approve`) releases a
+    # start=False card — including decomposed children via their start origin.
+    try:
+        if _kb.start_approval_exists(conn, task_id):
+            return True, None
+    except Exception:
+        pass  # fall through to the fail-closed plan check
     trow = conn.execute("SELECT title FROM tasks WHERE id = ?", (task_id,)).fetchone()
     title = trow["title"] if trow is not None else None
     try:
