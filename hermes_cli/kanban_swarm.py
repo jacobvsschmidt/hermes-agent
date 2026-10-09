@@ -190,12 +190,7 @@ def _create_swarm_uncommitted(
         title=root_title or f"Swarm: {goal.splitlines()[0][:80]}",
         body="Kanban Swarm v1 planning/root card. This card is completed "
              "immediately so parallel workers can start while it remains the "
-             f"shared blackboard and audit anchor.\n\nGoal:\n{goal}\n\n"
-             "MAALING: kortet er kun lukkbart naar swarmens dele kan maales — "
-             "(1) hver worker har et kort-id og et status-transit i event-loggen, "
-             "(2) verifierens gate-metadata er {\"gate\": \"pass\"} eller et "
-             "eksplicit block med manglende arbejde, og (3) synthesizerens "
-             "deliverable findes som artifact/sti. ",
+             f"shared blackboard and audit anchor.\n\nGoal:\n{goal}",
         assignee=created_by,
         priority=priority,
         idempotency_key=idempotency_key,
@@ -234,11 +229,7 @@ def _create_swarm_uncommitted(
         body=(
             "Review every worker handoff and blackboard update. Gate the swarm: "
             "complete only with metadata {\"gate\": \"pass\"} when evidence is "
-            "sufficient; otherwise block with exact missing work.\n\n"
-            "MAALING: verifier-kortet er kun lukkbart naar hver worker-handoff "
-            "har bevis i blackboarden (topology + opdateringer laest tilbage), "
-            "og gate-afgorelsen er skrevet som metadata {\"gate\": \"pass\"} "
-            "eller block med praecis manglende arbejde."
+            "sufficient; otherwise block with exact missing work."
             + context_suffix
         ),
         assignee=verifier_assignee,
@@ -252,10 +243,7 @@ def _create_swarm_uncommitted(
         title=synthesizer_title,
         body=(
             "Synthesize the verified worker outputs into the final deliverable. "
-            "Do not start until the verifier has passed the gate.\n\n"
-            "MAALING: synthesizer-kortet er kun lukkbart naar deliverable findes "
-            "som en virkelig artifact (fil-sti eller URL), som er verificeret "
-            "til at eksistere."
+            "Do not start until the verifier has passed the gate."
             + context_suffix
         ),
         assignee=synthesizer_assignee,
