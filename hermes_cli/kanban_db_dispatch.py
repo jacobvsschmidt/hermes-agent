@@ -1877,6 +1877,135 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
+def _startable_guard_env() -> Optional[bool]:
+    """Optional ops emergency override ``HERMES_KANBAN_STARTABLE_GUARD`` (a
+    ``0``/``off``/``false`` value turns the Regel 3 gate off). Returns None when
+    unset so the config/file-closed default applies."""
+    raw = os.environ.get("HERMES_KANBAN_STARTABLE_GUARD", "").strip()
+    if not raw:
+        return None
+    return raw.lower() not in {"0", "off", "false", "no", "disabled"}
+
+
+def configured_startable_guard() -> bool:
+    """Whether the Regel 2/3 startability gate is active for ready-lane spawns.
+
+    ``kanban.startable_guard`` in config, else the fail-closed default ``True``
+    (Regel 3 DEFENSE-IN-DEPTH, t_82cedb90). Fail-closed means an unreadable
+    config keeps the gate ON — a broken config can never widen the auto-start
+    scope. ``HERMES_KANBAN_STARTABLE_GUARD=0`` is the emergency release valve.
+    """
+    override = _startable_guard_env()
+    if override is not None:
+        return override
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("startable_guard")
+    except Exception:
+        return True
+    return True if raw is None else bool(raw)
+
+
+def configured_max_concurrent_workers() -> Optional[int]:
+    """Hard global worker ceiling ``kanban.max_concurrent_workers`` (>= 1).
+
+    Returns the configured value, or None when unset/invalid — the caller then
+    falls back to ``DEFAULT_MAX_CONCURRENT_WORKERS`` (3). ``HERMES_KANBAN_MAX_CONCURRENT_WORKERS``
+    is an ops override.
+    """
+    raw = os.environ.get("HERMES_KANBAN_MAX_CONCURRENT_WORKERS", "").strip()
+    if not raw:
+        try:
+            from hermes_cli.config import load_config_readonly
+            raw = (load_config_readonly() or {}).get("kanban", {}).get("max_concurrent_workers")
+        except Exception:
+            raw = None
+    if raw is None:
+        return None
+    try:
+        ival = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return ival if ival >= 1 else None
+
+
+def _plan_root() -> Path:
+    """``$HERMES_KANBAN_PLAN_DIR`` else ``<hermes root>/inbox`` (Regel 2/3 plan
+    store). Mirrors ``kanban_cli._plan_root`` so ``create --plan`` and the
+    dispatcher gate resolve the exact same file."""
+    override = os.environ.get("HERMES_KANBAN_PLAN_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return _kb.kanban_home() / "inbox"
+
+
+def _today_plan_authorizes(title: Optional[str]) -> tuple[bool, Optional[str]]:
+    """Fail-closed Regel 3 plan gate for the dispatcher's startability check.
+
+    True ONLY when today's plan file exists, is readable, and lists ``title``.
+    Plan file ``<plan_root>/<YYYY-MM-DD>-PLAN.md`` (``_plan_root``), date local.
+    Title match is case-insensitive on whitespace-collapsed line content (a bare
+    ``Title`` matches ``- Title`` / ``## Title``). Mirrors
+    ``kanban_cli._plan_authorizes`` so the dispatcher never disagrees with
+    ``create --plan``. Any failure — empty title, no file, unreadable file,
+    title absent — returns ``(False, reason)`` (refuse to start).
+    """
+    if not title or not title.strip():
+        return False, "cannot judge an empty title against today's plan"
+    plan = _plan_root() / f"{time.strftime('%Y-%m-%d')}-PLAN.md"
+    if not plan.is_file():
+        return False, f"today's plan not found at {plan} — unplanned card refused"
+    try:
+        text = plan.read_text(encoding="utf-8")
+    except OSError as exc:
+        return False, f"cannot read today's plan {plan}: {exc}"
+    needle = " ".join(title.strip().split()).casefold()
+    if not needle:
+        return False, "empty title"
+    for raw in text.splitlines():
+        line = " ".join(raw.split()).casefold()
+        if needle in line:
+            return True, None
+    return False, f"title {title!r} is not listed in today's plan {plan}"
+
+
+def _card_startable(conn: sqlite3.Connection, task_id: str) -> tuple[bool, Optional[str]]:
+    """``(can_start, reason)`` for one READY card under Regel 2/3.
+
+    A card may only auto-start when its ``created`` event carries ``start: true``
+    (an explicit ``--start``, or a ``--plan`` whose title matched today's plan at
+    creation — both recorded by ``create_task(start_authorized=...)``) OR its
+    title is listed in today's plan file. Everything else is refused fail-closed —
+    including, by construction, any card that leaked into ``ready`` from
+    ``triage`` or a bare self-create. Failure to read the created event or the
+    plan refuses too; never start "just in case".
+    """
+    start_authorized = False
+    try:
+        row = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'created' "
+            "ORDER BY created_at ASC, id ASC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is not None and row["payload"]:
+            data = _kb._json_or(row["payload"], {})
+            if isinstance(data, dict):
+                start_authorized = bool(data.get("start"))
+    except Exception:
+        # Cannot read the durable start marker — fail closed toward plan check.
+        start_authorized = False
+    if start_authorized:
+        return True, None
+    trow = conn.execute("SELECT title FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    title = trow["title"] if trow is not None else None
+    try:
+        return _today_plan_authorizes(title)
+    except Exception as exc:
+        # Truly unexpected plan failure — refuse to start, never "just in case".
+        return False, f"could not judge today's plan for card {task_id}: {exc}"
+
+
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
