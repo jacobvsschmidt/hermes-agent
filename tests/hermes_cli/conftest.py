@@ -20,6 +20,22 @@ def all_assignees_spawnable(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _regel3_guard_off_for_legacy_dispatch(monkeypatch):
+    """Keep the legacy dispatcher suite on pre-Regel-3 semantics.
+
+    The Regel 2/3 startable-guard (auto-start only for plan/start-authorized
+    ready cards) and the hard max-3 worker ceiling ship ON in production, but
+    the pre-existing dispatch tests create bare unplanned ready cards and
+    assert spawns under the old budget model. Flipping both env overrides off/loose
+    here preserves that suite without editing ~15 files; the guard's own tests
+    (``test_kanban_startable_guard.py``) pass explicit ``startable_guard`` /
+    ``max_concurrent_workers`` args and are unaffected by this default.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_STARTABLE_GUARD", "0")
+    monkeypatch.setenv("HERMES_KANBAN_MAX_CONCURRENT_WORKERS", "999")
+
+
+@pytest.fixture(autouse=True)
 def _suppress_concurrent_hermes_gate(request, monkeypatch):
     """Default ``_detect_concurrent_hermes_instances`` to ``[]`` for every test.
 
