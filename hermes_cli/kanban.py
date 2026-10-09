@@ -1133,15 +1133,17 @@ def _cmd_approve(args: argparse.Namespace) -> int:
     author = _profile_author()
     ids = list(dict.fromkeys(_bulk_ids(args)))
     released = 0
+    failed: list[str] = []
     with kbc.connect_closing() as conn:
         for tid in ids:
             ok, err = kb.approve_task_start(conn, tid, actor=author, note=reason)
             if not ok:
                 print(f"cannot approve {tid}: {err}", file=sys.stderr)
+                failed.append(tid)
                 continue
             released += kb.recompute_ready(conn)
             print(f"Approved start for {tid}" + (f": {reason}" if reason else ""))
-    return 0 if released >= 0 else 1
+    return 0 if not failed else 1
 
 
 def _cmd_archive(args: argparse.Namespace) -> int:

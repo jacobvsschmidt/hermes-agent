@@ -11,6 +11,7 @@ auto-decomposed and 28 minutes later promoted + claimed + spawned, breaking the
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban as kb_cli
 from hermes_cli.kanban_db_graph import decompose_triage_task
 
 
@@ -180,3 +182,40 @@ def test_start_true_behavior_untouched(kanban_home):
         assert kb.get_task(conn, child_id).status == "ready"
         assert kb.start_start_refusal(conn, child_id) is None
 
+
+# ---------------------------------------------------------------------------
+# CLI `_cmd_approve` — exit code must signal failed approvals (no silent
+# errors: rc 0 only when every requested id was approved).
+# ---------------------------------------------------------------------------
+
+
+def _approve_ns(task_id, *, ids=None, reason=None):
+    return argparse.Namespace(
+        task_id=task_id,
+        reason=list(reason or []),
+        ids=list(ids or []) or None,
+    )
+
+
+def test_approve_cli_exit_code_signals_failures(kanban_home, capsys):
+    """`hermes kanban approve` returns rc != 0 when any approval fails.
+
+    Approving an unknown id must not be a silent error: the failing id is
+    reported on stderr AND the command exits non-zero, so scripts and the
+    Smeden can tell a failed approval from a successful one. Mixed bulk
+    (one real, one bogus) also exits non-zero.
+    """
+    with kbc.connect() as conn:
+        real = kb.create_task(conn, title="real card", triage=True)
+
+    # Unknown id only -> rc 1, stderr carries the reason.
+    rc = kb_cli._cmd_approve(_approve_ns("does-not-exist"))
+    assert rc == 1
+    assert "cannot approve does-not-exist" in capsys.readouterr().err
+
+    # Mixed bulk: the real one succeeds, the bogus one fails -> rc 1.
+    rc = kb_cli._cmd_approve(_approve_ns(real, ids=["does-not-exist"]))
+    assert rc == 1
+    out = capsys.readouterr()
+    assert "Approved start for" in out.out
+    assert "cannot approve does-not-exist" in out.err
