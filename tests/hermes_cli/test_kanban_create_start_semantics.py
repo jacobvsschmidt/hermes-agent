@@ -163,3 +163,33 @@ def test_plan_authorized_starts(hermetic_home, plan_dir):
     # No profiles dir in the hermetic home => ready-owner gate does not bind.
     task = _cmd_create(["authorized-card", "--plan", "--body", BODY], None, hermetic_home)
     assert task.status == "ready"
+
+
+# --- regression t_cc2bbab1: bare create must not move the running counter ---
+
+def _running_count():
+    with kbc.connect_closing() as conn:
+        return kb.board_stats(conn)["by_status"].get("running", 0)
+
+
+def test_bare_create_leaves_running_count_unchanged(hermetic_home, monkeypatch):
+    """A bare create must never nudge the running count: it stays the same and
+    respects the hard ceiling (kanban.max_concurrent_workers, default 3).
+
+    Measures BEFORE and AFTER the create (the exact assertion the e2e regression
+    ticket t_cc2bbab1 demands), then cleans up the card it created.
+    """
+    before = _running_count()
+
+    task = _cmd_create(["regression-check", "--body", BODY], monkeypatch, hermetic_home)
+    assert task.status in ("triage", "todo"), f"bare create must park, got {task.status}"
+    assert task.status not in ("ready", "running")
+
+    after = _running_count()
+    assert after == before, f"running count moved: before={before} after={after}"
+    assert after <= 3, f"running count exceeds hard ceiling: {after} > 3"
+
+    # cleanup: archive (and purge) the card this test created
+    with kbc.connect_closing() as conn:
+        kb.archive_task(conn, task.id)
+    assert _running_count() == before
