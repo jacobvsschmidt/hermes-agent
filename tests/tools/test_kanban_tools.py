@@ -742,6 +742,32 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_records_start_intent(worker_env):
+    """t_bb1dbb89: the created event's ``start`` flag must match the real
+    start semantics — dependency children (worker fan-out with ``parents``)
+    wake by design when the parent completes, so they record ``start: true``;
+    a standalone card stays ``start: false`` (deliberately parked)."""
+    from tools import kanban_tools as kt
+    child = json.loads(kt._handle_create({
+        "title": "dependency child", "assignee": "peer", "parents": [worker_env],
+    }))
+    standalone = json.loads(kt._handle_create({
+        "title": "parked card", "assignee": "peer",
+    }))
+    assert child["ok"] and standalone["ok"]
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
+    try:
+        for tid, expected in ((child["task_id"], True), (standalone["task_id"], False)):
+            events = [e for e in kb.list_events(conn, tid) if e.kind == "created"]
+            assert events, tid
+            payload = events[-1].payload or {}
+            assert payload.get("start") is expected, tid
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])
 @pytest.mark.parametrize("target_scoped", [False, True])
 def test_create_explicit_scratch_ignores_ambient_board_project(

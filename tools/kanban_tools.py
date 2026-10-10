@@ -1145,6 +1145,12 @@ def _handle_create(args: dict, **kw) -> str:
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
+            # t_bb1dbb89: a dependency-child created by worker fan-out wakes by
+            # design when its parent completes — that dependency gate IS the
+            # start authorization. Record ``start: true`` so the created event
+            # means what it says: start=false is reserved for deliberately
+            # parked cards and decompose roots, never for dependency children.
+            start_authorized=bool(parents),
             initial_status=str(args.get("initial_status") or "running"),
             created_by=_persisted_identity(), session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
